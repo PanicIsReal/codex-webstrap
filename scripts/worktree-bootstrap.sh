@@ -9,6 +9,8 @@ SOURCE=""
 MODE="symlink"
 OVERWRITE="backup"
 EXTRAS="on"
+INSTALL="off"
+CHECKS="off"
 DRY_RUN="off"
 
 LINK_COUNT=0
@@ -35,6 +37,8 @@ Usage:
     [--mode symlink|copy] \
     [--overwrite backup|fail|keep] \
     [--extras on|off] \
+    [--install on|off] \
+    [--checks on|off] \
     [--dry-run]
 
 Defaults:
@@ -43,6 +47,8 @@ Defaults:
   --mode      symlink
   --overwrite backup
   --extras    on
+  --install   off (compatibility flag)
+  --checks    off (compatibility flag)
 USAGE
 }
 
@@ -108,6 +114,16 @@ parse_args() {
         EXTRAS="$(normalize_on_off "$2")"
         shift 2
         ;;
+      --install)
+        [[ $# -ge 2 ]] || die "--install requires a value"
+        INSTALL="$(normalize_on_off "$2")"
+        shift 2
+        ;;
+      --checks)
+        [[ $# -ge 2 ]] || die "--checks requires a value"
+        CHECKS="$(normalize_on_off "$2")"
+        shift 2
+        ;;
       --dry-run)
         DRY_RUN="on"
         shift
@@ -169,10 +185,15 @@ detect_source_checkout() {
   fi
 
   mapfile -t worktree_paths < <(git -C "$TARGET" worktree list --porcelain | awk '/^worktree /{sub(/^worktree /,""); print}')
-  [[ ${#worktree_paths[@]} -gt 0 ]] || die "Could not read git worktree list from target: $TARGET"
+  [[ ${#worktree_paths[@]} -gt 0 ]] || {
+    action_log "WARN" "Could not read git worktree list from target: $TARGET"
+    SOURCE=""
+    return
+  }
 
   local current="$TARGET"
   local candidate
+  local first_non_current=""
   for candidate in "${worktree_paths[@]}"; do
     local candidate_abs=""
     if [[ -d "$candidate" ]]; then
@@ -180,6 +201,9 @@ detect_source_checkout() {
     fi
     [[ -n "$candidate_abs" ]] || continue
     [[ "$candidate_abs" == "$current" ]] && continue
+    if [[ -z "$first_non_current" ]]; then
+      first_non_current="$candidate_abs"
+    fi
 
     local has_core=0
     local rel
@@ -197,7 +221,14 @@ detect_source_checkout() {
     fi
   done
 
-  die "No source checkout found with core paths. Pass --source <path>."
+  if [[ -n "$first_non_current" ]]; then
+    SOURCE="$first_non_current"
+    action_log "WARN" "No source checkout found with core paths; using first non-current worktree: $SOURCE"
+    return
+  fi
+
+  SOURCE=""
+  action_log "WARN" "No non-current worktree available for migration; continuing without source sync."
 }
 
 ensure_parent_dir() {
@@ -272,6 +303,11 @@ install_path() {
 }
 
 migrate_core_paths() {
+  if [[ -z "$SOURCE" ]]; then
+    action_log "SKIP" "No source checkout selected; skipping core path migration"
+    return 0
+  fi
+
   local rel
   for rel in "${CORE_PATHS[@]}"; do
     local src="$SOURCE/$rel"
@@ -290,6 +326,11 @@ discover_extra_paths() {
   local source_root="$1"
   find "$source_root" \
     -path "$source_root/.git" -prune -o \
+    -path "$source_root/node_modules" -prune -o \
+    -path "$source_root/.cache" -prune -o \
+    -path "$source_root/dist" -prune -o \
+    -path "$source_root/build" -prune -o \
+    -path "$source_root/out" -prune -o \
     -type f \( \
       -name "*.pem" -o \
       -name "*.key" -o \
@@ -311,6 +352,11 @@ migrate_optional_extras() {
     action_log "SKIP" "Optional extras migration disabled (--extras off)"
     return 0
   }
+
+  if [[ -z "$SOURCE" ]]; then
+    action_log "SKIP" "No source checkout selected; skipping optional extras migration"
+    return 0
+  fi
 
   if ! git -C "$SOURCE" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     action_log "WARN" "Source is not a git repo. Skipping optional extras."
@@ -350,6 +396,19 @@ print_summary() {
   printf '%s\n' "INFO   LINK=$LINK_COUNT COPY=$COPY_COUNT SKIP=$SKIP_COUNT BACKUP=$BACKUP_COUNT WARN=$WARN_COUNT ERROR=$ERROR_COUNT"
 }
 
+run_checks() {
+  [[ "$CHECKS" == "on" ]] || return 0
+  command -v git >/dev/null 2>&1 || die "Missing required tool: git"
+  action_log "INFO" "Compatibility checks passed"
+}
+
+run_dependency_installs() {
+  [[ "$INSTALL" == "on" ]] || return 0
+  # Compatibility flag with repos that run install steps. This repo keeps setup
+  # lightweight and does not auto-install dependencies during worktree creation.
+  action_log "SKIP" "Install step requested, but no auto-install is configured for this repo"
+}
+
 main() {
   parse_args "$@"
   validate_options
@@ -360,14 +419,16 @@ main() {
   load_core_paths
 
   detect_source_checkout
-  [[ "$SOURCE" == "$TARGET" ]] && die "Source and target cannot be the same path: $SOURCE"
+  [[ -n "$SOURCE" && "$SOURCE" == "$TARGET" ]] && die "Source and target cannot be the same path: $SOURCE"
 
   action_log "INFO" "Target checkout: $TARGET"
-  action_log "INFO" "Source checkout: $SOURCE"
-  action_log "INFO" "Mode=$MODE Overwrite=$OVERWRITE Extras=$EXTRAS DryRun=$DRY_RUN"
+  action_log "INFO" "Source checkout: ${SOURCE:-<none>}"
+  action_log "INFO" "Mode=$MODE Overwrite=$OVERWRITE Extras=$EXTRAS Install=$INSTALL Checks=$CHECKS DryRun=$DRY_RUN"
 
+  run_checks
   migrate_core_paths
   migrate_optional_extras
+  run_dependency_installs
   print_summary
 }
 

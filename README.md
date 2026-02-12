@@ -199,6 +199,12 @@ Core paths are configured via:
 
 - `scripts/worktree-secrets.manifest`
 
+Codex setup-script compatible command:
+
+```bash
+./scripts/worktree-bootstrap.sh --mode symlink --overwrite backup --extras on --install on --checks on
+```
+
 ### Typical Troubleshooting
 
 - `401 unauthorized`
