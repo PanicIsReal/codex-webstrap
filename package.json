@@ -1,0 +1,18 @@
+{
+  "name": "codex-webstrapper",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Web wrapper for Codex desktop assets with bridge + token auth",
+  "scripts": {
+    "start": "node src/server.mjs",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@electron/asar": "^4.0.1",
+    "ws": "^8.18.0"
+  }
+}
