@@ -75,6 +75,8 @@ This project provides near-parity by emulation/bridging, not by removing those d
 
 ```bash
 codex-webstrap [--port <n>] [--bind <ip>] [--open] [--token-file <path>] [--codex-app <path>]
+codex-webstrapper [--port <n>] [--bind <ip>] [--open] [--token-file <path>] [--codex-app <path>]
+codex-webstrapper open [--port <n>] [--bind <ip>] [--token-file <path>] [--copy]
 ```
 
 ### Environment Overrides
@@ -131,7 +133,7 @@ npm install -g codex-webstrapper
 With global install:
 
 ```bash
-codex-webstrap --port 8080 --bind 127.0.0.1
+codex-webstrapper --port 8080 --bind 127.0.0.1
 ```
 
 From local checkout:
@@ -143,7 +145,19 @@ From local checkout:
 Optional auto-open:
 
 ```bash
-codex-webstrap --open
+codex-webstrapper --open
+```
+
+Generate/open the full auth URL from your persisted token:
+
+```bash
+codex-webstrapper open
+```
+
+Copy the full auth URL (including token) to macOS clipboard:
+
+```bash
+codex-webstrapper open --copy
 ```
 
 ## Authentication Model
@@ -153,6 +167,12 @@ codex-webstrap --open
 
 ```bash
 open "http://127.0.0.1:8080/__webstrapper/auth?token=$(cat ~/.codex-webstrap/token)"
+```
+
+Or use the helper command:
+
+```bash
+codex-webstrapper open
 ```
 
 3. Server sets `cw_session` cookie (`HttpOnly`, `SameSite=Lax`, scoped to `/`).

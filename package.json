@@ -1,11 +1,12 @@
 {
   "name": "codex-webstrapper",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "description": "Web wrapper for Codex desktop assets with bridge + token auth",
   "license": "MIT",
   "bin": {
-    "codex-webstrap": "./bin/codex-webstrap.sh"
+    "codex-webstrap": "./bin/codex-webstrap.sh",
+    "codex-webstrapper": "./bin/codex-webstrap.sh"
   },
   "files": [
     "bin/",
