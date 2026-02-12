@@ -218,6 +218,67 @@ test("virtual vscode fetch endpoints return expected payload shapes", async () =
   router.dispose();
 });
 
+test("local-environments lists workspace environment configs", async (t) => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "cw-local-envs-"));
+  t.after(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  });
+
+  const envDir = path.join(tempDir, ".codex", "environments");
+  const envPath = path.join(envDir, "environment.toml");
+  await fs.mkdir(envDir, { recursive: true });
+  await fs.writeFile(envPath, [
+    "version = 1",
+    'name = "my-local-env"',
+    "",
+    "[setup]",
+    'script = "./scripts/worktree-bootstrap.sh"'
+  ].join("\n"));
+
+  const router = new MessageRouter({ appServer: null, udsClient: null });
+  const ws = createMockWs();
+
+  await router.handleEnvelope(ws, {
+    type: "view-message",
+    payload: {
+      type: "fetch",
+      requestId: "local-envs",
+      method: "POST",
+      url: "vscode://codex/local-environments",
+      body: JSON.stringify({
+        params: {
+          workspaceRoot: tempDir
+        }
+      })
+    }
+  });
+
+  const envelope = ws.sent.find((entry) => (
+    entry.type === "main-message"
+    && entry.payload?.type === "fetch-response"
+    && entry.payload?.requestId === "local-envs"
+  ));
+
+  assert.ok(envelope);
+  const parsed = JSON.parse(envelope.payload.bodyJsonString);
+  assert.equal(Array.isArray(parsed.environments), true);
+  assert.equal(parsed.environments.length, 1);
+  assert.deepEqual(parsed.environments[0], {
+    type: "success",
+    configPath: envPath,
+    environment: {
+      version: 1,
+      name: "my-local-env",
+      setup: {
+        script: "./scripts/worktree-bootstrap.sh"
+      },
+      actions: []
+    }
+  });
+
+  router.dispose();
+});
+
 test("gh-cli-status reflects installed + auth state", async () => {
   const router = new MessageRouter({ appServer: null, udsClient: null });
   const ws = createMockWs();

@@ -1019,7 +1019,7 @@ export class MessageRouter {
           };
           break;
         case "local-environments":
-          payload = [];
+          payload = await this._resolveLocalEnvironments(params);
           break;
         case "has-custom-cli-executable":
           payload = { hasCustomCliExecutable: false };
@@ -1524,6 +1524,128 @@ export class MessageRouter {
       return null;
     }
     return trimmed.replace(/\/+$/, "");
+  }
+
+  async _resolveLocalEnvironments(params) {
+    const workspaceRoot = this._resolveLocalEnvironmentWorkspaceRoot(params?.workspaceRoot);
+    if (!workspaceRoot) {
+      return { environments: [] };
+    }
+
+    const configDir = path.join(workspaceRoot, ".codex", "environments");
+    let entries;
+    try {
+      entries = await fs.readdir(configDir, { withFileTypes: true });
+    } catch {
+      return { environments: [] };
+    }
+
+    const configFiles = entries
+      .filter((entry) => entry.isFile() && /^environment(?:-\d+)?\.toml$/i.test(entry.name))
+      .map((entry) => entry.name)
+      .sort((left, right) => {
+        const leftIsDefault = left.toLowerCase() === "environment.toml";
+        const rightIsDefault = right.toLowerCase() === "environment.toml";
+        if (leftIsDefault && !rightIsDefault) {
+          return -1;
+        }
+        if (!leftIsDefault && rightIsDefault) {
+          return 1;
+        }
+        return left.localeCompare(right, undefined, { numeric: true, sensitivity: "base" });
+      });
+
+    if (configFiles.length === 0) {
+      return { environments: [] };
+    }
+
+    const environments = await Promise.all(configFiles.map(async (fileName) => {
+      const configPath = path.join(configDir, fileName);
+      try {
+        const raw = await fs.readFile(configPath, "utf8");
+        const environment = this._parseLocalEnvironmentConfig(raw, configPath);
+        return {
+          type: "success",
+          configPath,
+          environment
+        };
+      } catch (error) {
+        return {
+          type: "error",
+          configPath,
+          error: {
+            message: toErrorMessage(error)
+          }
+        };
+      }
+    }));
+
+    return { environments };
+  }
+
+  _resolveLocalEnvironmentWorkspaceRoot(root) {
+    const normalized = this._normalizeWorkspaceRoot(root);
+    if (normalized) {
+      return path.resolve(normalized);
+    }
+
+    const activeRoot = this._normalizeWorkspaceRoot(this.activeWorkspaceRoots?.[0]);
+    if (activeRoot) {
+      return path.resolve(activeRoot);
+    }
+
+    return this.defaultWorkspaceRoot ? path.resolve(this.defaultWorkspaceRoot) : null;
+  }
+
+  _parseLocalEnvironmentConfig(raw, configPath) {
+    const name = this._parseTomlString(raw, "name") || path.basename(configPath, ".toml");
+    const versionRaw = this._parseTomlNumber(raw, "version");
+    const setupScript = this._parseTomlStringInSection(raw, "setup", "script") || "";
+
+    return {
+      version: Number.isInteger(versionRaw) ? versionRaw : 1,
+      name,
+      setup: {
+        script: setupScript
+      },
+      actions: []
+    };
+  }
+
+  _parseTomlString(raw, key) {
+    const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const pattern = new RegExp(`^\\s*${escapedKey}\\s*=\\s*(?:"([^"]*)"|'([^']*)')\\s*$`, "m");
+    const match = raw.match(pattern);
+    if (!match) {
+      return null;
+    }
+    return match[1] ?? match[2] ?? null;
+  }
+
+  _parseTomlNumber(raw, key) {
+    const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const pattern = new RegExp(`^\\s*${escapedKey}\\s*=\\s*(-?\\d+)\\s*$`, "m");
+    const match = raw.match(pattern);
+    if (!match) {
+      return null;
+    }
+    const value = Number.parseInt(match[1], 10);
+    return Number.isNaN(value) ? null : value;
+  }
+
+  _parseTomlStringInSection(raw, sectionName, key) {
+    const escapedSection = sectionName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const sectionPattern = new RegExp(`^\\s*\\[${escapedSection}\\]\\s*$`, "m");
+    const sectionMatch = sectionPattern.exec(raw);
+    if (!sectionMatch) {
+      return null;
+    }
+
+    const sectionStart = sectionMatch.index + sectionMatch[0].length;
+    const rest = raw.slice(sectionStart);
+    const nextSectionMatch = rest.match(/^\s*\[[^\]]+\]\s*$/m);
+    const sectionBody = nextSectionMatch ? rest.slice(0, nextSectionMatch.index) : rest;
+    return this._parseTomlString(sectionBody, key);
   }
 
   _loadPersistedGlobalState() {
