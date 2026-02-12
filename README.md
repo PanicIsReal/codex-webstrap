@@ -1,5 +1,7 @@
 # codex-webstrap
 
+![Frosted Sidebar Demo](assets/frosted-sidebar.gif)
+
 `codex-webstrap` is a macOS wrapper that lets you run the Codex desktop client UI in a browser while keeping backend execution local.
 
 This started as a personal project to remotely access the Codex desktop experience; it is open sourced so others can use and improve it.
@@ -183,6 +185,19 @@ Unknown message types produce structured `bridge-error` responses and do not cra
 ```bash
 npm test
 ```
+
+### Worktree Bootstrap
+
+Bootstrap env/secrets from another worktree checkout:
+
+```bash
+./scripts/worktree-bootstrap.sh --dry-run
+./scripts/worktree-bootstrap.sh --mode symlink
+```
+
+Core paths are configured via:
+
+- `scripts/worktree-secrets.manifest`
 
 ### Typical Troubleshooting
 
