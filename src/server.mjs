@@ -114,6 +114,7 @@ async function main() {
   const config = parseConfig();
 
   const tokenResult = await ensurePersistentToken(config.tokenFile);
+  const runtimeMetadataPath = `${tokenResult.tokenFilePath}.runtime`;
   const sessionStore = new SessionStore({ ttlMs: 1000 * 60 * 60 * 12 });
   const auth = createAuthController({ token: tokenResult.token, sessionStore });
 
@@ -299,6 +300,25 @@ async function main() {
     server.listen(config.port, config.bind, resolve);
   });
 
+  try {
+    await fs.writeFile(
+      runtimeMetadataPath,
+      JSON.stringify({
+        bind: config.bind,
+        port: config.port,
+        tokenFile: tokenResult.tokenFilePath,
+        pid: process.pid,
+        startedAt: Date.now()
+      }) + "\n",
+      { mode: 0o600 }
+    );
+  } catch (error) {
+    logger.warn("Failed to write runtime metadata file", {
+      path: runtimeMetadataPath,
+      error: toErrorMessage(error)
+    });
+  }
+
   const authHint = `http://${config.bind}:${config.port}/__webstrapper/auth?token=<redacted>`;
   const loginCommand = `open \"http://${config.bind}:${config.port}/__webstrapper/auth?token=$(cat ${tokenResult.tokenFilePath})\"`;
 
@@ -356,6 +376,11 @@ async function main() {
     await new Promise((resolve) => {
       server.close(() => resolve());
     });
+    try {
+      await fs.unlink(runtimeMetadataPath);
+    } catch {
+      // ignore
+    }
 
     process.exit(0);
   }
