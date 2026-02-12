@@ -335,8 +335,10 @@ export class MessageRouter {
     this.activeWorkspaceRoots = [this.defaultWorkspaceRoot];
     this.userSelectedActiveWorkspaceRoots = false;
     this.globalStatePath = globalStatePath || path.join(os.homedir(), ".codex", ".codex-global-state.json");
-    this._loadPersistedWorkspaceState();
-    this._persistWorkspaceState();
+    this.globalState = {};
+    this.globalStateWriteTimer = null;
+    this._loadPersistedGlobalState();
+    this._persistWorkspaceState({ writeToDisk: false });
     this.sharedObjects.set("host_config", this.hostConfig);
 
     this.terminals = new TerminalRegistry((ws, payload) => {
@@ -439,6 +441,12 @@ export class MessageRouter {
   }
 
   dispose() {
+    if (this.globalStateWriteTimer) {
+      clearTimeout(this.globalStateWriteTimer);
+      this.globalStateWriteTimer = null;
+      void this._writeGlobalStateToDisk();
+    }
+
     this.terminals.dispose();
     this.gitWorker.dispose();
 
@@ -554,6 +562,7 @@ export class MessageRouter {
               key: message.key,
               value: message.value
             });
+            this._scheduleGlobalStateWrite();
           }
           return;
         case "persisted-atom-reset":
@@ -564,6 +573,7 @@ export class MessageRouter {
               key: message.key,
               value: null
             });
+            this._scheduleGlobalStateWrite();
           }
           return;
         case "shared-object-subscribe":
@@ -658,9 +668,14 @@ export class MessageRouter {
           this._openInBrowser(ws, message);
           return;
         case "show-diff":
+          this.sendMainMessage(ws, {
+            type: "toggle-diff-panel",
+            open: true
+          });
+          return;
         case "show-plan-summary":
         case "navigate-in-new-editor-tab":
-          this._handleBrowserEquivalent(ws, message);
+          // Matches desktop host behavior: these are no-ops.
           return;
         case "electron-set-badge-count":
         case "power-save-blocker-set":
@@ -702,6 +717,12 @@ export class MessageRouter {
 
   _handleReady(ws) {
     this.sendMainMessage(ws, {
+      type: "shared-object-updated",
+      key: "host_config",
+      value: this.sharedObjects.get("host_config")
+    });
+
+    this.sendMainMessage(ws, {
       type: "active-workspace-roots-updated",
       roots: this.activeWorkspaceRoots
     });
@@ -736,7 +757,7 @@ export class MessageRouter {
       body: typeof message.body === "string" ? message.body.slice(0, 400) : null
     });
 
-    if (this._handleVirtualFetch(ws, requestId, message)) {
+    if (await this._handleVirtualFetch(ws, requestId, message)) {
       return;
     }
 
@@ -826,7 +847,7 @@ export class MessageRouter {
     return null;
   }
 
-  _handleVirtualFetch(ws, requestId, message) {
+  async _handleVirtualFetch(ws, requestId, message) {
     if (typeof message.url !== "string") {
       return false;
     }
@@ -880,8 +901,14 @@ export class MessageRouter {
             };
             break;
           }
+          const hasGlobalStateValue = typeof key === "string"
+            && Object.prototype.hasOwnProperty.call(this.globalState, key);
           payload = {
-            value: key ? this.persistedAtomState.get(key) ?? null : null
+            value: key
+              ? hasGlobalStateValue
+                ? this.globalState[key]
+                : this.persistedAtomState.get(key) ?? null
+              : null
           };
           break;
         }
@@ -889,20 +916,26 @@ export class MessageRouter {
           const key = params?.key;
           const value = params?.value;
           if (typeof key === "string" && key.length > 0) {
+            const isActiveWorkspaceRoots = key === "active-workspace-roots";
+            const isSavedWorkspaceRoots = key === "electron-saved-workspace-roots";
+            const isWorkspaceLabels = key === "electron-workspace-root-labels";
+
             if (value == null) {
               this.persistedAtomState.delete(key);
+              delete this.globalState[key];
             } else {
               this.persistedAtomState.set(key, value);
+              this.globalState[key] = value;
             }
 
-            if (key === "active-workspace-roots" && Array.isArray(value)) {
+            if (isActiveWorkspaceRoots && Array.isArray(value)) {
               this.activeWorkspaceRoots = [...new Set(
                 value
                   .map((root) => this._normalizeWorkspaceRoot(root))
                   .filter(Boolean)
               )];
               this.userSelectedActiveWorkspaceRoots = true;
-            } else if (key === "electron-saved-workspace-roots" && value && typeof value === "object") {
+            } else if (isSavedWorkspaceRoots && value && typeof value === "object") {
               const roots = Array.isArray(value.roots)
                 ? [...new Set(
                   value.roots
@@ -914,13 +947,18 @@ export class MessageRouter {
               if (roots.length > 0) {
                 this.workspaceRootOptions = { roots, labels };
               }
-            } else if (key === "electron-workspace-root-labels" && value && typeof value === "object") {
+            } else if (isWorkspaceLabels && value && typeof value === "object") {
               this.workspaceRootOptions = {
                 ...this.workspaceRootOptions,
                 labels: value
               };
             }
-            this._persistWorkspaceState();
+
+            if (isActiveWorkspaceRoots || isSavedWorkspaceRoots || isWorkspaceLabels) {
+              this._persistWorkspaceState();
+            } else {
+              this._scheduleGlobalStateWrite();
+            }
           }
           payload = { ok: true };
           break;
@@ -1008,13 +1046,16 @@ export class MessageRouter {
         case "git-origins": {
           const dirs = Array.isArray(params?.dirs) ? params.dirs.filter((dir) => typeof dir === "string" && dir.length > 0) : [];
           payload = {
-            origins: dirs.map((dir) => ({
-              dir,
-              root: dir,
-              commonDir: dir,
-              originUrl: null
-            }))
+            origins: await Promise.all(dirs.map((dir) => this._resolveGitOrigin(dir)))
           };
+          break;
+        }
+        case "git-merge-base": {
+          const gitRoot = typeof params?.gitRoot === "string" && params.gitRoot.length > 0
+            ? params.gitRoot
+            : process.cwd();
+          const baseBranch = typeof params?.baseBranch === "string" ? params.baseBranch.trim() : "";
+          payload = await this._resolveGitMergeBase({ gitRoot, baseBranch });
           break;
         }
         case "list-pending-automation-run-threads":
@@ -1051,11 +1092,16 @@ export class MessageRouter {
           payload = { notices: [] };
           break;
         case "gh-cli-status":
-          payload = { isInstalled: false, isAuthenticated: false };
+          payload = await this._resolveGhCliStatus();
           break;
-        case "gh-pr-status":
-          payload = {};
+        case "gh-pr-status": {
+          const cwd = typeof params?.cwd === "string" && params.cwd.length > 0
+            ? params.cwd
+            : process.cwd();
+          const headBranch = typeof params?.headBranch === "string" ? params.headBranch.trim() : "";
+          payload = await this._resolveGhPrStatus({ cwd, headBranch });
           break;
+        }
         case "paths-exist": {
           const paths = Array.isArray(params?.paths) ? params.paths.filter((p) => typeof p === "string") : [];
           payload = { existingPaths: paths };
@@ -1141,6 +1187,215 @@ export class MessageRouter {
     return false;
   }
 
+  async _resolveGitOrigin(dir) {
+    const normalizedDir = this._normalizeWorkspaceRoot(dir) || dir;
+    const fallback = {
+      dir: normalizedDir,
+      root: normalizedDir,
+      commonDir: normalizedDir,
+      originUrl: null
+    };
+
+    const rootResult = await this._runCommand("git", ["-C", normalizedDir, "rev-parse", "--show-toplevel"], {
+      timeoutMs: 5_000
+    });
+    if (!rootResult.ok || !rootResult.stdout) {
+      return fallback;
+    }
+
+    const root = this._normalizeWorkspaceRoot(rootResult.stdout) || normalizedDir;
+
+    const commonDirResult = await this._runCommand("git", ["-C", normalizedDir, "rev-parse", "--git-common-dir"], {
+      timeoutMs: 5_000
+    });
+    const commonDir = commonDirResult.ok && commonDirResult.stdout
+      ? path.resolve(normalizedDir, commonDirResult.stdout)
+      : root;
+
+    const originResult = await this._runCommand("git", ["-C", normalizedDir, "remote", "get-url", "origin"], {
+      timeoutMs: 5_000,
+      allowNonZero: true
+    });
+
+    return {
+      dir: normalizedDir,
+      root,
+      commonDir,
+      originUrl: originResult.ok && originResult.stdout ? originResult.stdout : null
+    };
+  }
+
+  async _resolveGhCliStatus() {
+    const ghVersion = await this._runCommand("gh", ["--version"], {
+      timeoutMs: 3_000,
+      allowNonZero: true
+    });
+
+    if (!ghVersion.ok) {
+      return {
+        isInstalled: false,
+        isAuthenticated: false
+      };
+    }
+
+    const auth = await this._runCommand("gh", ["auth", "status", "--hostname", "github.com"], {
+      timeoutMs: 4_000,
+      allowNonZero: true
+    });
+
+    return {
+      isInstalled: true,
+      isAuthenticated: auth.ok
+    };
+  }
+
+  async _resolveGhPrStatus({ cwd, headBranch }) {
+    if (!headBranch) {
+      return {
+        status: "success",
+        hasOpenPr: false,
+        url: null,
+        number: null
+      };
+    }
+
+    const ghStatus = await this._resolveGhCliStatus();
+    if (!ghStatus.isInstalled || !ghStatus.isAuthenticated) {
+      return {
+        status: "error",
+        hasOpenPr: false,
+        url: null,
+        number: null,
+        error: "gh cli unavailable or unauthenticated"
+      };
+    }
+
+    const listResult = await this._runCommand(
+      "gh",
+      ["pr", "list", "--state", "open", "--head", headBranch, "--json", "number,url", "--limit", "1"],
+      {
+        timeoutMs: 8_000,
+        allowNonZero: true,
+        cwd
+      }
+    );
+
+    if (!listResult.ok) {
+      return {
+        status: "error",
+        hasOpenPr: false,
+        url: null,
+        number: null,
+        error: listResult.error || "failed to query open pull requests"
+      };
+    }
+
+    const parsed = safeJsonParse(listResult.stdout);
+    if (!Array.isArray(parsed) || parsed.length === 0) {
+      return {
+        status: "success",
+        hasOpenPr: false,
+        url: null,
+        number: null
+      };
+    }
+
+    const first = parsed[0] && typeof parsed[0] === "object" ? parsed[0] : {};
+    const number = Number.isInteger(first.number) ? first.number : null;
+    const url = typeof first.url === "string" && first.url.length > 0 ? first.url : null;
+
+    return {
+      status: "success",
+      hasOpenPr: true,
+      url,
+      number
+    };
+  }
+
+  async _resolveGitMergeBase({ gitRoot, baseBranch }) {
+    if (!baseBranch) {
+      return {
+        mergeBaseSha: null
+      };
+    }
+
+    const result = await this._runCommand(
+      "git",
+      ["-C", gitRoot, "merge-base", "HEAD", baseBranch],
+      {
+        timeoutMs: 5_000,
+        allowNonZero: true
+      }
+    );
+
+    return {
+      mergeBaseSha: result.ok && result.stdout ? result.stdout : null
+    };
+  }
+
+  async _runCommand(command, args, { timeoutMs = 5_000, allowNonZero = false, cwd = process.cwd() } = {}) {
+    return new Promise((resolve) => {
+      const child = spawn(command, args, {
+        cwd,
+        env: process.env,
+        stdio: ["ignore", "pipe", "pipe"]
+      });
+
+      let stdout = "";
+      let stderr = "";
+      let settled = false;
+
+      const finish = (result) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timeout);
+        resolve(result);
+      };
+
+      child.stdout?.on("data", (chunk) => {
+        stdout += chunk.toString("utf8");
+      });
+
+      child.stderr?.on("data", (chunk) => {
+        stderr += chunk.toString("utf8");
+      });
+
+      child.on("error", (error) => {
+        finish({
+          ok: false,
+          code: null,
+          stdout: stdout.trim(),
+          stderr: stderr.trim(),
+          error: toErrorMessage(error)
+        });
+      });
+
+      child.on("exit", (code) => {
+        const success = code === 0;
+        finish({
+          ok: success,
+          code,
+          stdout: stdout.trim(),
+          stderr: stderr.trim(),
+          error: success || allowNonZero ? null : stderr.trim() || `exit code ${String(code)}`
+        });
+      });
+
+      const timeout = setTimeout(() => {
+        child.kill("SIGTERM");
+        finish({
+          ok: false,
+          code: null,
+          stdout: stdout.trim(),
+          stderr: stderr.trim(),
+          error: `command timed out after ${timeoutMs}ms`
+        });
+      }, timeoutMs);
+    });
+  }
+
   _sendFetchJson(ws, { requestId, url, status = 200, payload = {} }) {
     const bodyJsonString = JSON.stringify(payload);
     this.sendMainMessage(ws, {
@@ -1216,7 +1471,7 @@ export class MessageRouter {
     return trimmed.replace(/\/+$/, "");
   }
 
-  _loadPersistedWorkspaceState() {
+  _loadPersistedGlobalState() {
     if (!this.globalStatePath) {
       return;
     }
@@ -1228,9 +1483,22 @@ export class MessageRouter {
       return;
     }
 
-    const rawSavedRoots = parsed?.["electron-saved-workspace-roots"];
-    const rawActiveRoots = parsed?.["active-workspace-roots"];
-    const rawLabels = parsed?.["electron-workspace-root-labels"];
+    if (!parsed || typeof parsed !== "object") {
+      return;
+    }
+
+    this.globalState = parsed;
+
+    const persistedAtoms = parsed["electron-persisted-atom-state"];
+    if (persistedAtoms && typeof persistedAtoms === "object" && !Array.isArray(persistedAtoms)) {
+      for (const [key, value] of Object.entries(persistedAtoms)) {
+        this.persistedAtomState.set(key, value);
+      }
+    }
+
+    const rawSavedRoots = parsed["electron-saved-workspace-roots"];
+    const rawActiveRoots = parsed["active-workspace-roots"];
+    const rawLabels = parsed["electron-workspace-root-labels"];
 
     let savedRoots = [];
     if (Array.isArray(rawSavedRoots)) {
@@ -1246,7 +1514,11 @@ export class MessageRouter {
     )];
 
     if (normalizedSavedRoots.length > 0) {
-      const labels = rawLabels && typeof rawLabels === "object" ? rawLabels : {};
+      const labels = rawLabels && typeof rawLabels === "object"
+        ? rawLabels
+        : rawSavedRoots && typeof rawSavedRoots === "object" && rawSavedRoots.labels && typeof rawSavedRoots.labels === "object"
+          ? rawSavedRoots.labels
+          : {};
       this.workspaceRootOptions = {
         roots: normalizedSavedRoots,
         labels
@@ -1310,10 +1582,80 @@ export class MessageRouter {
     };
   }
 
-  _persistWorkspaceState() {
+  _persistWorkspaceState({ writeToDisk = true } = {}) {
+    const labels = this.workspaceRootOptions.labels || {};
+    const roots = [...this.workspaceRootOptions.roots];
+    const activeRoots = [...this.activeWorkspaceRoots];
+
+    this.globalState["active-workspace-roots"] = activeRoots;
+    this.globalState["electron-saved-workspace-roots"] = roots;
+    this.globalState["electron-workspace-root-labels"] = labels;
+
     this.persistedAtomState.set("active-workspace-roots", this.activeWorkspaceRoots);
     this.persistedAtomState.set("electron-saved-workspace-roots", this.workspaceRootOptions);
-    this.persistedAtomState.set("electron-workspace-root-labels", this.workspaceRootOptions.labels || {});
+    this.persistedAtomState.set("electron-workspace-root-labels", labels);
+
+    if (writeToDisk) {
+      this._scheduleGlobalStateWrite();
+    }
+  }
+
+  _scheduleGlobalStateWrite() {
+    if (!this.globalStatePath) {
+      return;
+    }
+
+    if (this.globalStateWriteTimer) {
+      clearTimeout(this.globalStateWriteTimer);
+    }
+
+    this.globalStateWriteTimer = setTimeout(() => {
+      this.globalStateWriteTimer = null;
+      void this._writeGlobalStateToDisk();
+    }, 50);
+
+    if (typeof this.globalStateWriteTimer?.unref === "function") {
+      this.globalStateWriteTimer.unref();
+    }
+  }
+
+  _buildGlobalStatePayload() {
+    const persistedAtomState = {};
+    for (const [key, value] of this.persistedAtomState.entries()) {
+      if (
+        key === "active-workspace-roots"
+        || key === "electron-saved-workspace-roots"
+        || key === "electron-workspace-root-labels"
+      ) {
+        continue;
+      }
+      persistedAtomState[key] = value;
+    }
+
+    return {
+      ...this.globalState,
+      "active-workspace-roots": this.activeWorkspaceRoots,
+      "electron-saved-workspace-roots": this.workspaceRootOptions.roots,
+      "electron-workspace-root-labels": this.workspaceRootOptions.labels || {},
+      "electron-persisted-atom-state": persistedAtomState
+    };
+  }
+
+  async _writeGlobalStateToDisk() {
+    if (!this.globalStatePath) {
+      return;
+    }
+
+    try {
+      const payload = this._buildGlobalStatePayload();
+      await fs.mkdir(path.dirname(this.globalStatePath), { recursive: true });
+      await fs.writeFile(this.globalStatePath, JSON.stringify(payload));
+    } catch (error) {
+      this.logger.warn("Failed to persist global state", {
+        path: this.globalStatePath,
+        error: toErrorMessage(error)
+      });
+    }
   }
 
   _subscribeSharedObject(ws, key) {
@@ -1464,19 +1806,6 @@ export class MessageRouter {
       detached: true
     });
     child.unref();
-  }
-
-  _handleBrowserEquivalent(ws, message) {
-    const path = message.path || message.route;
-    if (path) {
-      this.sendMainMessage(ws, {
-        type: "navigate-to-route",
-        path
-      });
-      return;
-    }
-
-    this.sendBridgeError(ws, "browser_equivalent_noop", `${message.type} received with no route/path.`);
   }
 
   sendBridgeEnvelope(ws, envelope) {
