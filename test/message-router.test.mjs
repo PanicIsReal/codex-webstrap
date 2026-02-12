@@ -61,6 +61,45 @@ test("update-diff-if-open is safely ignored", async () => {
   router.dispose();
 });
 
+test("show-diff opens diff panel", async () => {
+  const router = new MessageRouter({ appServer: null, udsClient: null });
+  const ws = createMockWs();
+
+  await router.handleEnvelope(ws, {
+    type: "view-message",
+    payload: {
+      type: "show-diff",
+      conversationId: "c1",
+      unifiedDiff: "diff --git a/x b/x"
+    }
+  });
+
+  assert.equal(ws.sent.length, 1);
+  assert.equal(ws.sent[0].type, "main-message");
+  assert.deepEqual(ws.sent[0].payload, {
+    type: "toggle-diff-panel",
+    open: true
+  });
+  router.dispose();
+});
+
+test("show-plan-summary is safely ignored", async () => {
+  const router = new MessageRouter({ appServer: null, udsClient: null });
+  const ws = createMockWs();
+
+  await router.handleEnvelope(ws, {
+    type: "view-message",
+    payload: {
+      type: "show-plan-summary",
+      conversationId: "c1",
+      planContent: "- step 1"
+    }
+  });
+
+  assert.equal(ws.sent.length, 0);
+  router.dispose();
+});
+
 test("show-context-menu is safely ignored", async () => {
   const router = new MessageRouter({ appServer: null, udsClient: null });
   const ws = createMockWs();
@@ -145,6 +184,141 @@ test("virtual vscode fetch endpoints return expected payload shapes", async () =
   assert.equal(second.payload.type, "fetch-response");
   assert.equal(second.payload.requestId, "r2");
   assert.deepEqual(JSON.parse(second.payload.bodyJsonString), { config: {} });
+
+  router.dispose();
+});
+
+test("gh-cli-status reflects installed + auth state", async () => {
+  const router = new MessageRouter({ appServer: null, udsClient: null });
+  const ws = createMockWs();
+
+  router._runCommand = async (command, args) => {
+    if (command !== "gh") {
+      return { ok: false, stdout: "", stderr: "", error: "unexpected command" };
+    }
+    if (args[0] === "--version") {
+      return { ok: true, stdout: "gh version 2.70.0", stderr: "", error: null };
+    }
+    if (args[0] === "auth" && args[1] === "status") {
+      return { ok: true, stdout: "", stderr: "", error: null };
+    }
+    return { ok: false, stdout: "", stderr: "", error: "unexpected args" };
+  };
+
+  await router.handleEnvelope(ws, {
+    type: "view-message",
+    payload: {
+      type: "fetch",
+      requestId: "gh-status",
+      method: "POST",
+      url: "vscode://codex/gh-cli-status",
+      body: JSON.stringify({ params: {} })
+    }
+  });
+
+  const envelope = ws.sent[0];
+  assert.equal(envelope.type, "main-message");
+  assert.equal(envelope.payload.type, "fetch-response");
+  assert.deepEqual(JSON.parse(envelope.payload.bodyJsonString), {
+    isInstalled: true,
+    isAuthenticated: true
+  });
+
+  router.dispose();
+});
+
+test("gh-pr-status returns open PR metadata when present", async () => {
+  const router = new MessageRouter({ appServer: null, udsClient: null });
+  const ws = createMockWs();
+
+  router._runCommand = async (command, args) => {
+    if (command !== "gh") {
+      return { ok: false, stdout: "", stderr: "", error: "unexpected command" };
+    }
+    if (args[0] === "--version") {
+      return { ok: true, stdout: "gh version 2.70.0", stderr: "", error: null };
+    }
+    if (args[0] === "auth" && args[1] === "status") {
+      return { ok: true, stdout: "", stderr: "", error: null };
+    }
+    if (args[0] === "pr" && args[1] === "list") {
+      return {
+        ok: true,
+        stdout: JSON.stringify([{ number: 42, url: "https://github.com/org/repo/pull/42" }]),
+        stderr: "",
+        error: null
+      };
+    }
+    return { ok: false, stdout: "", stderr: "", error: "unexpected args" };
+  };
+
+  await router.handleEnvelope(ws, {
+    type: "view-message",
+    payload: {
+      type: "fetch",
+      requestId: "gh-pr",
+      method: "POST",
+      url: "vscode://codex/gh-pr-status",
+      body: JSON.stringify({
+        params: {
+          cwd: "/tmp/repo",
+          headBranch: "feature/test"
+        }
+      })
+    }
+  });
+
+  const envelope = ws.sent[0];
+  assert.equal(envelope.type, "main-message");
+  assert.equal(envelope.payload.type, "fetch-response");
+  assert.deepEqual(JSON.parse(envelope.payload.bodyJsonString), {
+    status: "success",
+    hasOpenPr: true,
+    url: "https://github.com/org/repo/pull/42",
+    number: 42
+  });
+
+  router.dispose();
+});
+
+test("git-merge-base returns merge-base sha", async () => {
+  const router = new MessageRouter({ appServer: null, udsClient: null });
+  const ws = createMockWs();
+
+  router._runCommand = async (command, args) => {
+    if (command === "git" && args[0] === "-C" && args[2] === "merge-base") {
+      return {
+        ok: true,
+        stdout: "abc123",
+        stderr: "",
+        error: null
+      };
+    }
+    return { ok: false, stdout: "", stderr: "", error: "unexpected command" };
+  };
+
+  await router.handleEnvelope(ws, {
+    type: "view-message",
+    payload: {
+      type: "fetch",
+      requestId: "merge-base",
+      method: "POST",
+      url: "vscode://codex/git-merge-base",
+      body: JSON.stringify({
+        params: {
+          gitRoot: "/tmp/repo",
+          baseBranch: "main"
+        }
+      })
+    }
+  });
+
+  const envelope = ws.sent[0];
+  assert.equal(envelope.type, "main-message");
+  assert.equal(envelope.payload.type, "fetch-response");
+  assert.deepEqual(JSON.parse(envelope.payload.bodyJsonString), {
+    mergeBaseSha: "abc123"
+  });
 
   router.dispose();
 });

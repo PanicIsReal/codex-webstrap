@@ -658,9 +658,14 @@ export class MessageRouter {
           this._openInBrowser(ws, message);
           return;
         case "show-diff":
+          this.sendMainMessage(ws, {
+            type: "toggle-diff-panel",
+            open: true
+          });
+          return;
         case "show-plan-summary":
         case "navigate-in-new-editor-tab":
-          this._handleBrowserEquivalent(ws, message);
+          // Matches desktop host behavior: these are no-ops.
           return;
         case "electron-set-badge-count":
         case "power-save-blocker-set":
@@ -736,7 +741,7 @@ export class MessageRouter {
       body: typeof message.body === "string" ? message.body.slice(0, 400) : null
     });
 
-    if (this._handleVirtualFetch(ws, requestId, message)) {
+    if (await this._handleVirtualFetch(ws, requestId, message)) {
       return;
     }
 
@@ -826,7 +831,7 @@ export class MessageRouter {
     return null;
   }
 
-  _handleVirtualFetch(ws, requestId, message) {
+  async _handleVirtualFetch(ws, requestId, message) {
     if (typeof message.url !== "string") {
       return false;
     }
@@ -1008,13 +1013,16 @@ export class MessageRouter {
         case "git-origins": {
           const dirs = Array.isArray(params?.dirs) ? params.dirs.filter((dir) => typeof dir === "string" && dir.length > 0) : [];
           payload = {
-            origins: dirs.map((dir) => ({
-              dir,
-              root: dir,
-              commonDir: dir,
-              originUrl: null
-            }))
+            origins: await Promise.all(dirs.map((dir) => this._resolveGitOrigin(dir)))
           };
+          break;
+        }
+        case "git-merge-base": {
+          const gitRoot = typeof params?.gitRoot === "string" && params.gitRoot.length > 0
+            ? params.gitRoot
+            : process.cwd();
+          const baseBranch = typeof params?.baseBranch === "string" ? params.baseBranch.trim() : "";
+          payload = await this._resolveGitMergeBase({ gitRoot, baseBranch });
           break;
         }
         case "list-pending-automation-run-threads":
@@ -1051,11 +1059,16 @@ export class MessageRouter {
           payload = { notices: [] };
           break;
         case "gh-cli-status":
-          payload = { isInstalled: false, isAuthenticated: false };
+          payload = await this._resolveGhCliStatus();
           break;
-        case "gh-pr-status":
-          payload = {};
+        case "gh-pr-status": {
+          const cwd = typeof params?.cwd === "string" && params.cwd.length > 0
+            ? params.cwd
+            : process.cwd();
+          const headBranch = typeof params?.headBranch === "string" ? params.headBranch.trim() : "";
+          payload = await this._resolveGhPrStatus({ cwd, headBranch });
           break;
+        }
         case "paths-exist": {
           const paths = Array.isArray(params?.paths) ? params.paths.filter((p) => typeof p === "string") : [];
           payload = { existingPaths: paths };
@@ -1139,6 +1152,215 @@ export class MessageRouter {
     }
 
     return false;
+  }
+
+  async _resolveGitOrigin(dir) {
+    const normalizedDir = this._normalizeWorkspaceRoot(dir) || dir;
+    const fallback = {
+      dir: normalizedDir,
+      root: normalizedDir,
+      commonDir: normalizedDir,
+      originUrl: null
+    };
+
+    const rootResult = await this._runCommand("git", ["-C", normalizedDir, "rev-parse", "--show-toplevel"], {
+      timeoutMs: 5_000
+    });
+    if (!rootResult.ok || !rootResult.stdout) {
+      return fallback;
+    }
+
+    const root = this._normalizeWorkspaceRoot(rootResult.stdout) || normalizedDir;
+
+    const commonDirResult = await this._runCommand("git", ["-C", normalizedDir, "rev-parse", "--git-common-dir"], {
+      timeoutMs: 5_000
+    });
+    const commonDir = commonDirResult.ok && commonDirResult.stdout
+      ? path.resolve(normalizedDir, commonDirResult.stdout)
+      : root;
+
+    const originResult = await this._runCommand("git", ["-C", normalizedDir, "remote", "get-url", "origin"], {
+      timeoutMs: 5_000,
+      allowNonZero: true
+    });
+
+    return {
+      dir: normalizedDir,
+      root,
+      commonDir,
+      originUrl: originResult.ok && originResult.stdout ? originResult.stdout : null
+    };
+  }
+
+  async _resolveGhCliStatus() {
+    const ghVersion = await this._runCommand("gh", ["--version"], {
+      timeoutMs: 3_000,
+      allowNonZero: true
+    });
+
+    if (!ghVersion.ok) {
+      return {
+        isInstalled: false,
+        isAuthenticated: false
+      };
+    }
+
+    const auth = await this._runCommand("gh", ["auth", "status", "--hostname", "github.com"], {
+      timeoutMs: 4_000,
+      allowNonZero: true
+    });
+
+    return {
+      isInstalled: true,
+      isAuthenticated: auth.ok
+    };
+  }
+
+  async _resolveGhPrStatus({ cwd, headBranch }) {
+    if (!headBranch) {
+      return {
+        status: "success",
+        hasOpenPr: false,
+        url: null,
+        number: null
+      };
+    }
+
+    const ghStatus = await this._resolveGhCliStatus();
+    if (!ghStatus.isInstalled || !ghStatus.isAuthenticated) {
+      return {
+        status: "error",
+        hasOpenPr: false,
+        url: null,
+        number: null,
+        error: "gh cli unavailable or unauthenticated"
+      };
+    }
+
+    const listResult = await this._runCommand(
+      "gh",
+      ["pr", "list", "--state", "open", "--head", headBranch, "--json", "number,url", "--limit", "1"],
+      {
+        timeoutMs: 8_000,
+        allowNonZero: true,
+        cwd
+      }
+    );
+
+    if (!listResult.ok) {
+      return {
+        status: "error",
+        hasOpenPr: false,
+        url: null,
+        number: null,
+        error: listResult.error || "failed to query open pull requests"
+      };
+    }
+
+    const parsed = safeJsonParse(listResult.stdout);
+    if (!Array.isArray(parsed) || parsed.length === 0) {
+      return {
+        status: "success",
+        hasOpenPr: false,
+        url: null,
+        number: null
+      };
+    }
+
+    const first = parsed[0] && typeof parsed[0] === "object" ? parsed[0] : {};
+    const number = Number.isInteger(first.number) ? first.number : null;
+    const url = typeof first.url === "string" && first.url.length > 0 ? first.url : null;
+
+    return {
+      status: "success",
+      hasOpenPr: true,
+      url,
+      number
+    };
+  }
+
+  async _resolveGitMergeBase({ gitRoot, baseBranch }) {
+    if (!baseBranch) {
+      return {
+        mergeBaseSha: null
+      };
+    }
+
+    const result = await this._runCommand(
+      "git",
+      ["-C", gitRoot, "merge-base", "HEAD", baseBranch],
+      {
+        timeoutMs: 5_000,
+        allowNonZero: true
+      }
+    );
+
+    return {
+      mergeBaseSha: result.ok && result.stdout ? result.stdout : null
+    };
+  }
+
+  async _runCommand(command, args, { timeoutMs = 5_000, allowNonZero = false, cwd = process.cwd() } = {}) {
+    return new Promise((resolve) => {
+      const child = spawn(command, args, {
+        cwd,
+        env: process.env,
+        stdio: ["ignore", "pipe", "pipe"]
+      });
+
+      let stdout = "";
+      let stderr = "";
+      let settled = false;
+
+      const finish = (result) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timeout);
+        resolve(result);
+      };
+
+      child.stdout?.on("data", (chunk) => {
+        stdout += chunk.toString("utf8");
+      });
+
+      child.stderr?.on("data", (chunk) => {
+        stderr += chunk.toString("utf8");
+      });
+
+      child.on("error", (error) => {
+        finish({
+          ok: false,
+          code: null,
+          stdout: stdout.trim(),
+          stderr: stderr.trim(),
+          error: toErrorMessage(error)
+        });
+      });
+
+      child.on("exit", (code) => {
+        const success = code === 0;
+        finish({
+          ok: success,
+          code,
+          stdout: stdout.trim(),
+          stderr: stderr.trim(),
+          error: success || allowNonZero ? null : stderr.trim() || `exit code ${String(code)}`
+        });
+      });
+
+      const timeout = setTimeout(() => {
+        child.kill("SIGTERM");
+        finish({
+          ok: false,
+          code: null,
+          stdout: stdout.trim(),
+          stderr: stderr.trim(),
+          error: `command timed out after ${timeoutMs}ms`
+        });
+      }, timeoutMs);
+    });
   }
 
   _sendFetchJson(ws, { requestId, url, status = 200, payload = {} }) {
@@ -1464,19 +1686,6 @@ export class MessageRouter {
       detached: true
     });
     child.unref();
-  }
-
-  _handleBrowserEquivalent(ws, message) {
-    const path = message.path || message.route;
-    if (path) {
-      this.sendMainMessage(ws, {
-        type: "navigate-to-route",
-        path
-      });
-      return;
-    }
-
-    this.sendBridgeError(ws, "browser_equivalent_noop", `${message.type} received with no route/path.`);
   }
 
   sendBridgeEnvelope(ws, envelope) {
