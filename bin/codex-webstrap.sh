@@ -22,6 +22,15 @@ BIND_SET="0"
 COPY_FLAG="0"
 COMMAND="serve"
 
+# Treat non-empty env overrides as explicit selections so open-mode runtime
+# autodetection cannot replace them.
+if [[ -n "${CODEX_WEBSTRAP_PORT:-}" ]]; then
+  PORT_SET="1"
+fi
+if [[ -n "${CODEX_WEBSTRAP_BIND:-}" ]]; then
+  BIND_SET="1"
+fi
+
 DEFAULT_TOKEN_FILE="${HOME}/.codex-webstrap/token"
 if [[ -z "$TOKEN_FILE" ]]; then
   TOKEN_FILE="$DEFAULT_TOKEN_FILE"
