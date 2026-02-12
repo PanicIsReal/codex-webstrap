@@ -74,7 +74,7 @@ This project provides near-parity by emulation/bridging, not by removing those d
 ### CLI
 
 ```bash
-./bin/codex-webstrap.sh [--port <n>] [--bind <ip>] [--open] [--token-file <path>] [--codex-app <path>]
+codex-webstrap [--port <n>] [--bind <ip>] [--open] [--token-file <path>] [--codex-app <path>]
 ```
 
 ### Environment Overrides
@@ -120,7 +120,21 @@ This project provides near-parity by emulation/bridging, not by removing those d
 npm install
 ```
 
+Global CLI install:
+
+```bash
+npm install -g codex-webstrapper
+```
+
 ### Run
+
+With global install:
+
+```bash
+codex-webstrap --port 8080 --bind 127.0.0.1
+```
+
+From local checkout:
 
 ```bash
 ./bin/codex-webstrap.sh --port 8080 --bind 127.0.0.1
@@ -129,7 +143,7 @@ npm install
 Optional auto-open:
 
 ```bash
-./bin/codex-webstrap.sh --open
+codex-webstrap --open
 ```
 
 ## Authentication Model
