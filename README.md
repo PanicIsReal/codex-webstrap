@@ -6,6 +6,10 @@ This started as a personal project to remotely access the Codex desktop experien
 
 ## What It Is
 
+
+https://github.com/user-attachments/assets/24e023ee-6a74-448c-892d-9fc1964bd10c
+
+
 Codex desktop is not a pure web app. The renderer expects Electron preload APIs, IPC, local process control, worker threads, and desktop-only integrations.
 
 `codex-webstrap` makes browser access possible by:
