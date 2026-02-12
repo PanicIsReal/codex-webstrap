@@ -335,8 +335,10 @@ export class MessageRouter {
     this.activeWorkspaceRoots = [this.defaultWorkspaceRoot];
     this.userSelectedActiveWorkspaceRoots = false;
     this.globalStatePath = globalStatePath || path.join(os.homedir(), ".codex", ".codex-global-state.json");
-    this._loadPersistedWorkspaceState();
-    this._persistWorkspaceState();
+    this.globalState = {};
+    this.globalStateWriteTimer = null;
+    this._loadPersistedGlobalState();
+    this._persistWorkspaceState({ writeToDisk: false });
     this.sharedObjects.set("host_config", this.hostConfig);
 
     this.terminals = new TerminalRegistry((ws, payload) => {
@@ -439,6 +441,12 @@ export class MessageRouter {
   }
 
   dispose() {
+    if (this.globalStateWriteTimer) {
+      clearTimeout(this.globalStateWriteTimer);
+      this.globalStateWriteTimer = null;
+      void this._writeGlobalStateToDisk();
+    }
+
     this.terminals.dispose();
     this.gitWorker.dispose();
 
@@ -554,6 +562,7 @@ export class MessageRouter {
               key: message.key,
               value: message.value
             });
+            this._scheduleGlobalStateWrite();
           }
           return;
         case "persisted-atom-reset":
@@ -564,6 +573,7 @@ export class MessageRouter {
               key: message.key,
               value: null
             });
+            this._scheduleGlobalStateWrite();
           }
           return;
         case "shared-object-subscribe":
@@ -706,6 +716,12 @@ export class MessageRouter {
   }
 
   _handleReady(ws) {
+    this.sendMainMessage(ws, {
+      type: "shared-object-updated",
+      key: "host_config",
+      value: this.sharedObjects.get("host_config")
+    });
+
     this.sendMainMessage(ws, {
       type: "active-workspace-roots-updated",
       roots: this.activeWorkspaceRoots
@@ -885,8 +901,14 @@ export class MessageRouter {
             };
             break;
           }
+          const hasGlobalStateValue = typeof key === "string"
+            && Object.prototype.hasOwnProperty.call(this.globalState, key);
           payload = {
-            value: key ? this.persistedAtomState.get(key) ?? null : null
+            value: key
+              ? hasGlobalStateValue
+                ? this.globalState[key]
+                : this.persistedAtomState.get(key) ?? null
+              : null
           };
           break;
         }
@@ -894,20 +916,26 @@ export class MessageRouter {
           const key = params?.key;
           const value = params?.value;
           if (typeof key === "string" && key.length > 0) {
+            const isActiveWorkspaceRoots = key === "active-workspace-roots";
+            const isSavedWorkspaceRoots = key === "electron-saved-workspace-roots";
+            const isWorkspaceLabels = key === "electron-workspace-root-labels";
+
             if (value == null) {
               this.persistedAtomState.delete(key);
+              delete this.globalState[key];
             } else {
               this.persistedAtomState.set(key, value);
+              this.globalState[key] = value;
             }
 
-            if (key === "active-workspace-roots" && Array.isArray(value)) {
+            if (isActiveWorkspaceRoots && Array.isArray(value)) {
               this.activeWorkspaceRoots = [...new Set(
                 value
                   .map((root) => this._normalizeWorkspaceRoot(root))
                   .filter(Boolean)
               )];
               this.userSelectedActiveWorkspaceRoots = true;
-            } else if (key === "electron-saved-workspace-roots" && value && typeof value === "object") {
+            } else if (isSavedWorkspaceRoots && value && typeof value === "object") {
               const roots = Array.isArray(value.roots)
                 ? [...new Set(
                   value.roots
@@ -919,13 +947,18 @@ export class MessageRouter {
               if (roots.length > 0) {
                 this.workspaceRootOptions = { roots, labels };
               }
-            } else if (key === "electron-workspace-root-labels" && value && typeof value === "object") {
+            } else if (isWorkspaceLabels && value && typeof value === "object") {
               this.workspaceRootOptions = {
                 ...this.workspaceRootOptions,
                 labels: value
               };
             }
-            this._persistWorkspaceState();
+
+            if (isActiveWorkspaceRoots || isSavedWorkspaceRoots || isWorkspaceLabels) {
+              this._persistWorkspaceState();
+            } else {
+              this._scheduleGlobalStateWrite();
+            }
           }
           payload = { ok: true };
           break;
@@ -1438,7 +1471,7 @@ export class MessageRouter {
     return trimmed.replace(/\/+$/, "");
   }
 
-  _loadPersistedWorkspaceState() {
+  _loadPersistedGlobalState() {
     if (!this.globalStatePath) {
       return;
     }
@@ -1450,9 +1483,22 @@ export class MessageRouter {
       return;
     }
 
-    const rawSavedRoots = parsed?.["electron-saved-workspace-roots"];
-    const rawActiveRoots = parsed?.["active-workspace-roots"];
-    const rawLabels = parsed?.["electron-workspace-root-labels"];
+    if (!parsed || typeof parsed !== "object") {
+      return;
+    }
+
+    this.globalState = parsed;
+
+    const persistedAtoms = parsed["electron-persisted-atom-state"];
+    if (persistedAtoms && typeof persistedAtoms === "object" && !Array.isArray(persistedAtoms)) {
+      for (const [key, value] of Object.entries(persistedAtoms)) {
+        this.persistedAtomState.set(key, value);
+      }
+    }
+
+    const rawSavedRoots = parsed["electron-saved-workspace-roots"];
+    const rawActiveRoots = parsed["active-workspace-roots"];
+    const rawLabels = parsed["electron-workspace-root-labels"];
 
     let savedRoots = [];
     if (Array.isArray(rawSavedRoots)) {
@@ -1468,7 +1514,11 @@ export class MessageRouter {
     )];
 
     if (normalizedSavedRoots.length > 0) {
-      const labels = rawLabels && typeof rawLabels === "object" ? rawLabels : {};
+      const labels = rawLabels && typeof rawLabels === "object"
+        ? rawLabels
+        : rawSavedRoots && typeof rawSavedRoots === "object" && rawSavedRoots.labels && typeof rawSavedRoots.labels === "object"
+          ? rawSavedRoots.labels
+          : {};
       this.workspaceRootOptions = {
         roots: normalizedSavedRoots,
         labels
@@ -1532,10 +1582,80 @@ export class MessageRouter {
     };
   }
 
-  _persistWorkspaceState() {
+  _persistWorkspaceState({ writeToDisk = true } = {}) {
+    const labels = this.workspaceRootOptions.labels || {};
+    const roots = [...this.workspaceRootOptions.roots];
+    const activeRoots = [...this.activeWorkspaceRoots];
+
+    this.globalState["active-workspace-roots"] = activeRoots;
+    this.globalState["electron-saved-workspace-roots"] = roots;
+    this.globalState["electron-workspace-root-labels"] = labels;
+
     this.persistedAtomState.set("active-workspace-roots", this.activeWorkspaceRoots);
     this.persistedAtomState.set("electron-saved-workspace-roots", this.workspaceRootOptions);
-    this.persistedAtomState.set("electron-workspace-root-labels", this.workspaceRootOptions.labels || {});
+    this.persistedAtomState.set("electron-workspace-root-labels", labels);
+
+    if (writeToDisk) {
+      this._scheduleGlobalStateWrite();
+    }
+  }
+
+  _scheduleGlobalStateWrite() {
+    if (!this.globalStatePath) {
+      return;
+    }
+
+    if (this.globalStateWriteTimer) {
+      clearTimeout(this.globalStateWriteTimer);
+    }
+
+    this.globalStateWriteTimer = setTimeout(() => {
+      this.globalStateWriteTimer = null;
+      void this._writeGlobalStateToDisk();
+    }, 50);
+
+    if (typeof this.globalStateWriteTimer?.unref === "function") {
+      this.globalStateWriteTimer.unref();
+    }
+  }
+
+  _buildGlobalStatePayload() {
+    const persistedAtomState = {};
+    for (const [key, value] of this.persistedAtomState.entries()) {
+      if (
+        key === "active-workspace-roots"
+        || key === "electron-saved-workspace-roots"
+        || key === "electron-workspace-root-labels"
+      ) {
+        continue;
+      }
+      persistedAtomState[key] = value;
+    }
+
+    return {
+      ...this.globalState,
+      "active-workspace-roots": this.activeWorkspaceRoots,
+      "electron-saved-workspace-roots": this.workspaceRootOptions.roots,
+      "electron-workspace-root-labels": this.workspaceRootOptions.labels || {},
+      "electron-persisted-atom-state": persistedAtomState
+    };
+  }
+
+  async _writeGlobalStateToDisk() {
+    if (!this.globalStatePath) {
+      return;
+    }
+
+    try {
+      const payload = this._buildGlobalStatePayload();
+      await fs.mkdir(path.dirname(this.globalStatePath), { recursive: true });
+      await fs.writeFile(this.globalStatePath, JSON.stringify(payload));
+    } catch (error) {
+      this.logger.warn("Failed to persist global state", {
+        path: this.globalStatePath,
+        error: toErrorMessage(error)
+      });
+    }
   }
 
   _subscribeSharedObject(ws, key) {

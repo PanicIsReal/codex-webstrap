@@ -1,5 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 
 import {
   FULL_HANDLING_BUCKET,
@@ -113,6 +116,33 @@ test("show-context-menu is safely ignored", async () => {
   });
 
   assert.equal(ws.sent.length, 0);
+  router.dispose();
+});
+
+test("ready emits host_config shared object update", async () => {
+  const hostConfig = {
+    id: "ssh-host-1",
+    display_name: "SSH Host",
+    kind: "ssh"
+  };
+  const router = new MessageRouter({ appServer: null, udsClient: null, hostConfig });
+  const ws = createMockWs();
+
+  await router.handleEnvelope(ws, {
+    type: "view-message",
+    payload: {
+      type: "ready"
+    }
+  });
+
+  const hostConfigEnvelope = ws.sent.find((entry) => (
+    entry.type === "main-message"
+    && entry.payload?.type === "shared-object-updated"
+    && entry.payload?.key === "host_config"
+  ));
+
+  assert.ok(hostConfigEnvelope);
+  assert.deepEqual(hostConfigEnvelope.payload.value, hostConfig);
   router.dispose();
 });
 
@@ -371,6 +401,74 @@ test("thread list responses are filtered to saved workspace roots", async () => 
     { id: "t2", cwd: "/repo/current/sub" },
     { id: "t3", cwd: "/repo/other" }
   ]);
+
+  router.dispose();
+});
+
+test("loads persisted atom and global state values from desktop global state file", async (t) => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "cw-router-test-"));
+  t.after(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  });
+
+  const globalStatePath = path.join(tempDir, ".codex-global-state.json");
+  await fs.writeFile(globalStatePath, JSON.stringify({
+    "electron-saved-workspace-roots": ["/repo/current"],
+    "active-workspace-roots": ["/repo/current"],
+    "electron-workspace-root-labels": { "/repo/current": "Current Repo" },
+    "electron-main-window-bounds": { x: 10, y: 20, width: 1000, height: 700 },
+    "electron-persisted-atom-state": {
+      appearanceTheme: "light",
+      "notifications-turn-mode": "always"
+    }
+  }));
+
+  const router = new MessageRouter({
+    appServer: null,
+    udsClient: null,
+    globalStatePath
+  });
+  const ws = createMockWs();
+
+  await router.handleEnvelope(ws, {
+    type: "view-message",
+    payload: {
+      type: "ready"
+    }
+  });
+
+  await router.handleEnvelope(ws, {
+    type: "view-message",
+    payload: {
+      type: "fetch",
+      requestId: "global-state",
+      method: "POST",
+      url: "vscode://codex/get-global-state",
+      body: JSON.stringify({
+        params: {
+          key: "electron-main-window-bounds"
+        }
+      })
+    }
+  });
+
+  const atomSyncEnvelope = ws.sent.find((entry) => (
+    entry.type === "main-message"
+    && entry.payload?.type === "persisted-atom-sync"
+  ));
+  assert.ok(atomSyncEnvelope);
+  assert.equal(atomSyncEnvelope.payload.state.appearanceTheme, "light");
+  assert.equal(atomSyncEnvelope.payload.state["notifications-turn-mode"], "always");
+
+  const globalStateEnvelope = ws.sent.find((entry) => (
+    entry.type === "main-message"
+    && entry.payload?.type === "fetch-response"
+    && entry.payload?.requestId === "global-state"
+  ));
+  assert.ok(globalStateEnvelope);
+  assert.deepEqual(JSON.parse(globalStateEnvelope.payload.bodyJsonString), {
+    value: { x: 10, y: 20, width: 1000, height: 700 }
+  });
 
   router.dispose();
 });
