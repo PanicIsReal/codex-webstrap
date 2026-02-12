@@ -353,6 +353,96 @@ test("git-merge-base returns merge-base sha", async () => {
   router.dispose();
 });
 
+test("git-push executes git and returns success payload", async () => {
+  const router = new MessageRouter({ appServer: null, udsClient: null });
+  const ws = createMockWs();
+
+  let observed = null;
+  router._runCommand = async (command, args, options) => {
+    observed = { command, args, options };
+    return {
+      ok: true,
+      code: 0,
+      stdout: "Everything up-to-date",
+      stderr: "",
+      error: null
+    };
+  };
+
+  await router.handleEnvelope(ws, {
+    type: "view-message",
+    payload: {
+      type: "fetch",
+      requestId: "git-push-ok",
+      method: "POST",
+      url: "vscode://codex/git-push",
+      body: JSON.stringify({
+        params: {
+          cwd: "/tmp/repo",
+          force: true
+        }
+      })
+    }
+  });
+
+  assert.deepEqual(observed?.command, "git");
+  assert.deepEqual(observed?.args, ["-C", "/tmp/repo", "push", "--force-with-lease"]);
+
+  const envelope = ws.sent[0];
+  assert.equal(envelope.type, "main-message");
+  assert.equal(envelope.payload.type, "fetch-response");
+  assert.equal(envelope.payload.status, 200);
+  assert.deepEqual(JSON.parse(envelope.payload.bodyJsonString), {
+    ok: true,
+    code: 0,
+    stdout: "Everything up-to-date",
+    stderr: ""
+  });
+
+  router.dispose();
+});
+
+test("git-push failure returns non-2xx response", async () => {
+  const router = new MessageRouter({ appServer: null, udsClient: null });
+  const ws = createMockWs();
+
+  router._runCommand = async () => ({
+    ok: false,
+    code: 1,
+    stdout: "",
+    stderr: "fatal: No configured push destination.",
+    error: "fatal: No configured push destination."
+  });
+
+  await router.handleEnvelope(ws, {
+    type: "view-message",
+    payload: {
+      type: "fetch",
+      requestId: "git-push-fail",
+      method: "POST",
+      url: "vscode://codex/git-push",
+      body: JSON.stringify({
+        params: {
+          cwd: "/tmp/repo",
+          force: false
+        }
+      })
+    }
+  });
+
+  const envelope = ws.sent[0];
+  assert.equal(envelope.type, "main-message");
+  assert.equal(envelope.payload.type, "fetch-response");
+  assert.equal(envelope.payload.status, 500);
+
+  const parsed = JSON.parse(envelope.payload.bodyJsonString);
+  assert.equal(parsed.ok, false);
+  assert.equal(parsed.code, 1);
+  assert.match(parsed.error, /push destination/i);
+
+  router.dispose();
+});
+
 test("thread list responses are filtered to saved workspace roots", async () => {
   const appServer = {
     on() {},

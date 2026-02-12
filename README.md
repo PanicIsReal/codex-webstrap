@@ -114,7 +114,12 @@ codex-webstrapper open [--port <n>] [--bind <ip>] [--token-file <path>] [--copy]
 - macOS
 - Node.js 20+
 - Installed Codex app bundle at `/Applications/Codex.app` (or pass `--codex-app`)
-- `codex` CLI available in `PATH` (or set `CODEX_CLI_PATH`)
+
+By default, webstrapper runs the app-server via the bundled desktop CLI at:
+- `/Applications/Codex.app/Contents/Resources/codex`
+
+Optional override:
+- `CODEX_CLI_PATH=/custom/codex`
 
 ### Install
 
@@ -252,7 +257,7 @@ Codex setup-script compatible command:
 - Codex app not found
   - Pass `--codex-app /path/to/Codex.app`.
 - `codex` CLI spawn failures
-  - Ensure `codex` is on `PATH` or set `CODEX_CLI_PATH`.
+  - Ensure the bundled CLI exists in your Codex app install, or set `CODEX_CLI_PATH`.
 
 ## License
 

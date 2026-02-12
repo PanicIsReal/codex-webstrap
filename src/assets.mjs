@@ -37,7 +37,8 @@ export function resolveCodexAppPaths(explicitCodexAppPath) {
   const resourcesPath = path.join(appPath, "Contents", "Resources");
   const asarPath = path.join(resourcesPath, "app.asar");
   const infoPlistPath = path.join(appPath, "Contents", "Info.plist");
-  return { appPath, resourcesPath, asarPath, infoPlistPath };
+  const codexCliPath = path.join(resourcesPath, "codex");
+  return { appPath, resourcesPath, asarPath, infoPlistPath, codexCliPath };
 }
 
 export async function ensureCodexAppExists(paths) {

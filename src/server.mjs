@@ -148,8 +148,20 @@ async function main() {
   });
   const patchedIndexHtml = await buildPatchedIndexHtml(assetBundle.indexPath);
 
+  let codexCliPath = process.env.CODEX_CLI_PATH || codexPaths.codexCliPath;
+  if (!process.env.CODEX_CLI_PATH) {
+    const bundledCliExists = await fs.access(codexPaths.codexCliPath).then(() => true).catch(() => false);
+    if (!bundledCliExists) {
+      codexCliPath = "codex";
+      logger.warn("Bundled Codex CLI not found, falling back to PATH", {
+        bundledCliPath: codexPaths.codexCliPath
+      });
+    }
+  }
+
   const appServer = new AppServerManager({
     internalPort: config.internalWsPort,
+    codexCliPath,
     logger: createLogger("app-server")
   });
 

@@ -880,6 +880,7 @@ export class MessageRouter {
       }
 
       let payload = {};
+      let status = 200;
       switch (endpoint) {
         case "get-global-state": {
           const key = params?.key;
@@ -1050,6 +1051,11 @@ export class MessageRouter {
           };
           break;
         }
+        case "git-push": {
+          payload = await this._handleGitPush(params);
+          status = payload.ok ? 200 : 500;
+          break;
+        }
         case "git-merge-base": {
           const gitRoot = typeof params?.gitRoot === "string" && params.gitRoot.length > 0
             ? params.gitRoot
@@ -1115,7 +1121,7 @@ export class MessageRouter {
       this._sendFetchJson(ws, {
         requestId,
         url: message.url,
-        status: 200,
+        status,
         payload
       });
       return true;
@@ -1330,6 +1336,55 @@ export class MessageRouter {
 
     return {
       mergeBaseSha: result.ok && result.stdout ? result.stdout : null
+    };
+  }
+
+  async _handleGitPush(params) {
+    const cwd = typeof params?.cwd === "string" && params.cwd.length > 0
+      ? params.cwd
+      : process.cwd();
+    const remote = typeof params?.remote === "string" && params.remote.trim().length > 0
+      ? params.remote.trim()
+      : null;
+    const branch = typeof params?.branch === "string" && params.branch.trim().length > 0
+      ? params.branch.trim()
+      : null;
+
+    const args = ["-C", cwd, "push"];
+    if (params?.force === true || params?.forceWithLease === true) {
+      args.push("--force-with-lease");
+    }
+    if (params?.setUpstream === true) {
+      args.push("--set-upstream");
+    }
+    if (remote) {
+      args.push(remote);
+    }
+    if (branch) {
+      args.push(branch);
+    }
+
+    const result = await this._runCommand("git", args, {
+      cwd,
+      timeoutMs: 120_000,
+      allowNonZero: true
+    });
+
+    if (result.ok) {
+      return {
+        ok: true,
+        code: result.code,
+        stdout: result.stdout || "",
+        stderr: result.stderr || ""
+      };
+    }
+
+    return {
+      ok: false,
+      code: result.code,
+      error: result.error || result.stderr || "git push failed",
+      stdout: result.stdout || "",
+      stderr: result.stderr || ""
     };
   }
 
