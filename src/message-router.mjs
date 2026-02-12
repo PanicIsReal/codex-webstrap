@@ -1051,6 +1051,16 @@ export class MessageRouter {
           };
           break;
         }
+        case "git-create-branch": {
+          payload = await this._handleGitCreateBranch(params);
+          status = payload.ok ? 200 : 500;
+          break;
+        }
+        case "git-checkout-branch": {
+          payload = await this._handleGitCheckoutBranch(params);
+          status = payload.ok ? 200 : 500;
+          break;
+        }
         case "git-push": {
           payload = await this._handleGitPush(params);
           status = payload.ok ? 200 : 500;
@@ -1108,14 +1118,29 @@ export class MessageRouter {
           payload = await this._resolveGhPrStatus({ cwd, headBranch });
           break;
         }
+        case "generate-pull-request-message":
+          payload = await this._handleGeneratePullRequestMessage(params);
+          break;
+        case "gh-pr-create":
+          payload = await this._handleGhPrCreate(params);
+          break;
         case "paths-exist": {
           const paths = Array.isArray(params?.paths) ? params.paths.filter((p) => typeof p === "string") : [];
           payload = { existingPaths: paths };
           break;
         }
         default:
-          this.logger.warn("Unhandled vscode fetch endpoint", { endpoint });
-          payload = {};
+          if (endpoint.startsWith("git-")) {
+            this.logger.warn("Unhandled git vscode fetch endpoint", { endpoint });
+            payload = {
+              ok: false,
+              error: `unhandled git endpoint: ${endpoint}`
+            };
+            status = 500;
+          } else {
+            this.logger.warn("Unhandled vscode fetch endpoint", { endpoint });
+            payload = {};
+          }
       }
 
       this._sendFetchJson(ws, {
@@ -1318,6 +1343,350 @@ export class MessageRouter {
     };
   }
 
+  async _handleGeneratePullRequestMessage(params) {
+    const cwd = typeof params?.cwd === "string" && params.cwd.length > 0
+      ? params.cwd
+      : process.cwd();
+    const prompt = typeof params?.prompt === "string" ? params.prompt : "";
+    const generated = await this._generatePullRequestMessageWithCodex({ cwd, prompt });
+    const fallback = generated || await this._generateFallbackPullRequestMessage({ cwd, prompt });
+    const title = this._normalizePullRequestTitle(fallback.title);
+    const body = this._normalizePullRequestBody(fallback.body);
+
+    return {
+      status: "success",
+      title,
+      body,
+      // Older clients read `bodyInstructions`; keep it in sync with the generated body.
+      bodyInstructions: body
+    };
+  }
+
+  _normalizePullRequestTitle(title) {
+    if (typeof title !== "string") {
+      return "Update project files";
+    }
+
+    const normalized = title.replace(/\s+/g, " ").trim();
+    if (normalized.length === 0) {
+      return "Update project files";
+    }
+    if (normalized.length <= 120) {
+      return normalized;
+    }
+    return `${normalized.slice(0, 117).trimEnd()}...`;
+  }
+
+  _normalizePullRequestBody(body) {
+    if (typeof body !== "string") {
+      return "## Summary\n- Update project files.\n\n## Testing\n- Not run (context not provided).";
+    }
+
+    const normalized = body.trim();
+    if (normalized.length > 0) {
+      return normalized;
+    }
+    return "## Summary\n- Update project files.\n\n## Testing\n- Not run (context not provided).";
+  }
+
+  _buildPullRequestCodexPrompt(prompt) {
+    const context = typeof prompt === "string" && prompt.trim().length > 0
+      ? prompt.trim().slice(0, 20_000)
+      : "No additional context was provided.";
+
+    return [
+      "Generate a GitHub pull request title and body.",
+      "Return JSON that matches the provided schema.",
+      "Requirements:",
+      "- title: concise imperative sentence, maximum 72 characters.",
+      "- body: markdown with sections exactly '## Summary' and '## Testing'.",
+      "- Summary should include 2 to 6 concrete bullet points.",
+      "- Testing should include bullet points. If unknown, say '- Not run (context not provided).'.",
+      "- Do not wrap output in code fences.",
+      "- Use only the provided context.",
+      "",
+      "Context:",
+      context
+    ].join("\n");
+  }
+
+  async _generatePullRequestMessageWithCodex({ cwd, prompt }) {
+    let tempDir = null;
+    try {
+      tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-webstrap-prmsg-"));
+      const schemaPath = path.join(tempDir, "schema.json");
+      const outputPath = path.join(tempDir, "output.json");
+      const schema = {
+        $schema: "http://json-schema.org/draft-07/schema#",
+        type: "object",
+        required: ["title", "body"],
+        additionalProperties: false,
+        properties: {
+          title: { type: "string" },
+          body: { type: "string" }
+        }
+      };
+      await fs.writeFile(schemaPath, JSON.stringify(schema), "utf8");
+
+      const result = await this._runCommand(
+        "codex",
+        [
+          "exec",
+          "--ephemeral",
+          "--sandbox",
+          "read-only",
+          "--output-schema",
+          schemaPath,
+          "--output-last-message",
+          outputPath,
+          this._buildPullRequestCodexPrompt(prompt)
+        ],
+        {
+          timeoutMs: 120_000,
+          allowNonZero: true,
+          cwd
+        }
+      );
+
+      if (!result.ok) {
+        this.logger.warn("PR message generation via codex failed", {
+          cwd,
+          error: result.error || result.stderr || "unknown error"
+        });
+        return null;
+      }
+
+      const rawOutput = await fs.readFile(outputPath, "utf8");
+      const parsed = safeJsonParse(rawOutput);
+      if (!parsed || typeof parsed !== "object") {
+        return null;
+      }
+
+      const title = this._normalizePullRequestTitle(parsed.title);
+      const body = this._normalizePullRequestBody(parsed.body);
+      return { title, body };
+    } catch (error) {
+      this.logger.warn("PR message generation via codex errored", {
+        cwd,
+        error: toErrorMessage(error)
+      });
+      return null;
+    } finally {
+      if (tempDir) {
+        await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+      }
+    }
+  }
+
+  async _resolvePullRequestBaseRef(cwd) {
+    const originHead = await this._runCommand(
+      "git",
+      ["-C", cwd, "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+      { timeoutMs: 5_000, allowNonZero: true, cwd }
+    );
+    if (originHead.ok && originHead.stdout) {
+      return originHead.stdout;
+    }
+
+    const candidates = ["origin/main", "origin/master", "main", "master"];
+    for (const candidate of candidates) {
+      const exists = await this._runCommand(
+        "git",
+        ["-C", cwd, "rev-parse", "--verify", "--quiet", candidate],
+        { timeoutMs: 5_000, allowNonZero: true, cwd }
+      );
+      if (exists.code === 0) {
+        return candidate;
+      }
+    }
+
+    return null;
+  }
+
+  async _generateFallbackPullRequestMessage({ cwd, prompt }) {
+    const baseRef = await this._resolvePullRequestBaseRef(cwd);
+    const logArgs = baseRef
+      ? ["-C", cwd, "log", "--no-merges", "--pretty=format:%s", `${baseRef}..HEAD`, "-n", "6"]
+      : ["-C", cwd, "log", "--no-merges", "--pretty=format:%s", "-n", "6"];
+    const logResult = await this._runCommand("git", logArgs, {
+      timeoutMs: 8_000,
+      allowNonZero: true,
+      cwd
+    });
+    const commitSubjects = (logResult.stdout || "")
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+
+    const range = baseRef ? `${baseRef}...HEAD` : "HEAD~1..HEAD";
+    const filesResult = await this._runCommand(
+      "git",
+      ["-C", cwd, "diff", "--name-only", "--diff-filter=ACMR", range],
+      { timeoutMs: 8_000, allowNonZero: true, cwd }
+    );
+    const changedFiles = (filesResult.stdout || "")
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+
+    const statsResult = await this._runCommand(
+      "git",
+      ["-C", cwd, "diff", "--numstat", range],
+      { timeoutMs: 8_000, allowNonZero: true, cwd }
+    );
+    let additions = 0;
+    let deletions = 0;
+    for (const line of (statsResult.stdout || "").split("\n")) {
+      const [addedRaw, deletedRaw] = line.split("\t");
+      const added = Number.parseInt(addedRaw, 10);
+      const deleted = Number.parseInt(deletedRaw, 10);
+      additions += Number.isFinite(added) ? added : 0;
+      deletions += Number.isFinite(deleted) ? deleted : 0;
+    }
+
+    const branch = await this._resolveGitCurrentBranch(cwd);
+    const title = this._normalizePullRequestTitle(
+      commitSubjects[0] || (branch ? `Update ${branch}` : "Update project files")
+    );
+
+    const summaryBullets = [];
+    for (const subject of commitSubjects.slice(0, 3)) {
+      summaryBullets.push(subject);
+    }
+    if (summaryBullets.length === 0) {
+      summaryBullets.push("Update project files.");
+    }
+    if (changedFiles.length > 0) {
+      summaryBullets.push(`Modify ${changedFiles.length} file${changedFiles.length === 1 ? "" : "s"}.`);
+    }
+    if (additions > 0 || deletions > 0) {
+      summaryBullets.push(`Diff summary: +${additions} / -${deletions} lines.`);
+    }
+    if (baseRef) {
+      summaryBullets.push(`Base branch: ${baseRef}.`);
+    }
+
+    const bodyLines = ["## Summary"];
+    for (const bullet of summaryBullets.slice(0, 6)) {
+      bodyLines.push(`- ${bullet}`);
+    }
+
+    bodyLines.push("", "## Testing", "- Not run (context not provided).");
+
+    if (changedFiles.length > 0) {
+      bodyLines.push("", "## Files Changed");
+      for (const file of changedFiles.slice(0, 12)) {
+        bodyLines.push(`- \`${file}\``);
+      }
+      if (changedFiles.length > 12) {
+        bodyLines.push(`- \`...and ${changedFiles.length - 12} more\``);
+      }
+    } else if (typeof prompt === "string" && prompt.trim().length > 0) {
+      bodyLines.push("", "## Notes", "- Generated from available thread context.");
+    }
+
+    return {
+      title,
+      body: this._normalizePullRequestBody(bodyLines.join("\n"))
+    };
+  }
+
+  _extractGithubPrUrl(text) {
+    if (typeof text !== "string" || text.length === 0) {
+      return null;
+    }
+    const match = text.match(/https:\/\/github\.com\/[^\s/]+\/[^\s/]+\/pull\/\d+/);
+    return match ? match[0] : null;
+  }
+
+  async _handleGhPrCreate(params) {
+    const cwd = typeof params?.cwd === "string" && params.cwd.length > 0
+      ? params.cwd
+      : process.cwd();
+    const headBranch = typeof params?.headBranch === "string" ? params.headBranch.trim() : "";
+    const baseBranch = typeof params?.baseBranch === "string" ? params.baseBranch.trim() : "";
+    const bodyInstructions = typeof params?.bodyInstructions === "string" ? params.bodyInstructions : "";
+    const titleOverride = typeof params?.titleOverride === "string" ? params.titleOverride.trim() : "";
+    const bodyOverride = typeof params?.bodyOverride === "string" ? params.bodyOverride.trim() : "";
+
+    if (!headBranch || !baseBranch) {
+      return {
+        status: "error",
+        error: "headBranch and baseBranch are required",
+        url: null,
+        number: null
+      };
+    }
+
+    const ghStatus = await this._resolveGhCliStatus();
+    if (!ghStatus.isInstalled || !ghStatus.isAuthenticated) {
+      return {
+        status: "error",
+        error: "gh cli unavailable or unauthenticated",
+        url: null,
+        number: null
+      };
+    }
+
+    const args = [
+      "pr",
+      "create",
+      "--head",
+      headBranch,
+      "--base",
+      baseBranch
+    ];
+    const shouldFill = titleOverride.length === 0 || bodyOverride.length === 0;
+    if (shouldFill) {
+      args.push("--fill");
+    }
+    if (titleOverride.length > 0) {
+      args.push("--title", titleOverride);
+    }
+    if (bodyOverride.length > 0) {
+      args.push("--body", bodyOverride);
+    } else if (bodyInstructions.trim().length > 0) {
+      args.push("--body", bodyInstructions);
+    }
+
+    const result = await this._runCommand("gh", args, {
+      timeoutMs: 30_000,
+      allowNonZero: true,
+      cwd
+    });
+
+    if (result.ok) {
+      const url = this._extractGithubPrUrl(result.stdout) || this._extractGithubPrUrl(result.stderr);
+      const numberMatch = url ? url.match(/\/pull\/(\d+)/) : null;
+      const number = numberMatch ? Number.parseInt(numberMatch[1], 10) : null;
+      return {
+        status: "success",
+        url: url || null,
+        number: Number.isFinite(number) ? number : null
+      };
+    }
+
+    const combinedOutput = `${result.stdout || ""}\n${result.stderr || ""}`;
+    const existingUrl = this._extractGithubPrUrl(combinedOutput);
+    const alreadyExists = /already exists|a pull request for branch/i.test(combinedOutput);
+    if (alreadyExists && existingUrl) {
+      const numberMatch = existingUrl.match(/\/pull\/(\d+)/);
+      const number = numberMatch ? Number.parseInt(numberMatch[1], 10) : null;
+      return {
+        status: "success",
+        url: existingUrl,
+        number: Number.isFinite(number) ? number : null
+      };
+    }
+
+    return {
+      status: "error",
+      error: result.error || result.stderr || "failed to create pull request",
+      url: null,
+      number: null
+    };
+  }
+
   async _resolveGitMergeBase({ gitRoot, baseBranch }) {
     if (!baseBranch) {
       return {
@@ -1339,16 +1708,138 @@ export class MessageRouter {
     };
   }
 
+  async _resolveGitCurrentBranch(cwd) {
+    const result = await this._runCommand("git", ["-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"], {
+      timeoutMs: 5_000,
+      allowNonZero: true,
+      cwd
+    });
+    if (!result.ok || !result.stdout || result.stdout === "HEAD") {
+      return null;
+    }
+    return result.stdout;
+  }
+
+  async _handleGitCreateBranch(params) {
+    const cwd = typeof params?.cwd === "string" && params.cwd.length > 0
+      ? params.cwd
+      : process.cwd();
+    const branch = typeof params?.branch === "string" && params.branch.trim().length > 0
+      ? params.branch.trim()
+      : null;
+
+    if (!branch) {
+      return {
+        ok: false,
+        code: null,
+        error: "branch is required",
+        stdout: "",
+        stderr: ""
+      };
+    }
+
+    const existingResult = await this._runCommand("git", ["-C", cwd, "show-ref", "--verify", "--quiet", `refs/heads/${branch}`], {
+      cwd,
+      timeoutMs: 10_000,
+      allowNonZero: true
+    });
+    if (existingResult.code === 0) {
+      return {
+        ok: true,
+        code: 0,
+        branch,
+        created: false,
+        alreadyExists: true,
+        stdout: existingResult.stdout || "",
+        stderr: existingResult.stderr || ""
+      };
+    }
+
+    const createResult = await this._runCommand("git", ["-C", cwd, "branch", branch], {
+      cwd,
+      timeoutMs: 10_000,
+      allowNonZero: true
+    });
+    if (createResult.ok) {
+      return {
+        ok: true,
+        code: createResult.code,
+        branch,
+        created: true,
+        alreadyExists: false,
+        stdout: createResult.stdout || "",
+        stderr: createResult.stderr || ""
+      };
+    }
+
+    return {
+      ok: false,
+      code: createResult.code,
+      error: createResult.error || createResult.stderr || "git branch failed",
+      stdout: createResult.stdout || "",
+      stderr: createResult.stderr || ""
+    };
+  }
+
+  async _handleGitCheckoutBranch(params) {
+    const cwd = typeof params?.cwd === "string" && params.cwd.length > 0
+      ? params.cwd
+      : process.cwd();
+    const branch = typeof params?.branch === "string" && params.branch.trim().length > 0
+      ? params.branch.trim()
+      : null;
+
+    if (!branch) {
+      return {
+        ok: false,
+        code: null,
+        error: "branch is required",
+        stdout: "",
+        stderr: ""
+      };
+    }
+
+    const checkoutResult = await this._runCommand("git", ["-C", cwd, "checkout", branch], {
+      cwd,
+      timeoutMs: 20_000,
+      allowNonZero: true
+    });
+    if (!checkoutResult.ok) {
+      return {
+        ok: false,
+        code: checkoutResult.code,
+        error: checkoutResult.error || checkoutResult.stderr || "git checkout failed",
+        stdout: checkoutResult.stdout || "",
+        stderr: checkoutResult.stderr || ""
+      };
+    }
+
+    const currentBranch = await this._resolveGitCurrentBranch(cwd);
+    return {
+      ok: true,
+      code: checkoutResult.code,
+      branch: currentBranch || branch,
+      stdout: checkoutResult.stdout || "",
+      stderr: checkoutResult.stderr || ""
+    };
+  }
+
   async _handleGitPush(params) {
     const cwd = typeof params?.cwd === "string" && params.cwd.length > 0
       ? params.cwd
       : process.cwd();
-    const remote = typeof params?.remote === "string" && params.remote.trim().length > 0
+    const explicitRemote = typeof params?.remote === "string" && params.remote.trim().length > 0
       ? params.remote.trim()
       : null;
     const branch = typeof params?.branch === "string" && params.branch.trim().length > 0
       ? params.branch.trim()
       : null;
+    const refspec = typeof params?.refspec === "string" && params.refspec.trim().length > 0
+      ? params.refspec.trim()
+      : null;
+    const remote = explicitRemote || (
+      params?.setUpstream === true && (branch || refspec) ? "origin" : null
+    );
 
     const args = ["-C", cwd, "push"];
     if (params?.force === true || params?.forceWithLease === true) {
@@ -1360,7 +1851,9 @@ export class MessageRouter {
     if (remote) {
       args.push(remote);
     }
-    if (branch) {
+    if (refspec) {
+      args.push(refspec);
+    } else if (branch) {
       args.push(branch);
     }
 

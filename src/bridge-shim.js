@@ -599,6 +599,18 @@
   }
 
   function sendMessageFromView(payload) {
+    if (payload?.type === "open-in-browser") {
+      const target = payload?.url || payload?.href || null;
+      if (target) {
+        const opened = window.open(target, "_blank", "noopener,noreferrer");
+        if (!opened) {
+          // Fallback when popup is blocked.
+          window.location.href = target;
+        }
+      }
+      return Promise.resolve();
+    }
+
     sendEnvelope({
       type: "view-message",
       payload

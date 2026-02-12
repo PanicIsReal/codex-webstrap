@@ -372,6 +372,113 @@ test("gh-pr-status returns open PR metadata when present", async () => {
   router.dispose();
 });
 
+test("generate-pull-request-message returns success payload", async () => {
+  const router = new MessageRouter({ appServer: null, udsClient: null });
+  const ws = createMockWs();
+  router._generatePullRequestMessageWithCodex = async () => ({
+    title: "Improve git PR workflow",
+    body: "## Summary\n- Add PR body generation.\n\n## Testing\n- npm test"
+  });
+
+  await router.handleEnvelope(ws, {
+    type: "view-message",
+    payload: {
+      type: "fetch",
+      requestId: "gh-pr-msg",
+      method: "POST",
+      url: "vscode://codex/generate-pull-request-message",
+      body: JSON.stringify({
+        params: {
+          prompt: "Summarize branch changes for PR body."
+        }
+      })
+    }
+  });
+
+  const envelope = ws.sent[0];
+  assert.equal(envelope.type, "main-message");
+  assert.equal(envelope.payload.type, "fetch-response");
+  const parsed = JSON.parse(envelope.payload.bodyJsonString);
+  assert.equal(parsed.status, "success");
+  assert.equal(parsed.title, "Improve git PR workflow");
+  assert.match(parsed.body, /## Summary/);
+  assert.equal(parsed.bodyInstructions, parsed.body);
+  assert.equal(typeof parsed.bodyInstructions, "string");
+
+  router.dispose();
+});
+
+test("gh-pr-create returns success payload with url", async () => {
+  const router = new MessageRouter({ appServer: null, udsClient: null });
+  const ws = createMockWs();
+  let createArgs = null;
+
+  router._runCommand = async (command, args) => {
+    if (command !== "gh") {
+      return { ok: false, stdout: "", stderr: "", error: "unexpected command" };
+    }
+    if (args[0] === "--version") {
+      return { ok: true, stdout: "gh version 2.70.0", stderr: "", error: null };
+    }
+    if (args[0] === "auth" && args[1] === "status") {
+      return { ok: true, stdout: "", stderr: "", error: null };
+    }
+    if (args[0] === "pr" && args[1] === "create") {
+      createArgs = args;
+      return {
+        ok: true,
+        stdout: "https://github.com/org/repo/pull/123",
+        stderr: "",
+        error: null
+      };
+    }
+    return { ok: false, stdout: "", stderr: "", error: "unexpected args" };
+  };
+
+  await router.handleEnvelope(ws, {
+    type: "view-message",
+    payload: {
+      type: "fetch",
+      requestId: "gh-pr-create",
+      method: "POST",
+      url: "vscode://codex/gh-pr-create",
+      body: JSON.stringify({
+        params: {
+          cwd: "/tmp/repo",
+          headBranch: "feature/test",
+          baseBranch: "main",
+          bodyInstructions: "Test body",
+          titleOverride: "Improve branch push flow",
+          bodyOverride: "## Summary\n- Add PR fields.\n\n## Testing\n- npm test"
+        }
+      })
+    }
+  });
+
+  const envelope = ws.sent[0];
+  assert.equal(envelope.type, "main-message");
+  assert.equal(envelope.payload.type, "fetch-response");
+  assert.deepEqual(JSON.parse(envelope.payload.bodyJsonString), {
+    status: "success",
+    url: "https://github.com/org/repo/pull/123",
+    number: 123
+  });
+  assert.deepEqual(createArgs, [
+    "pr",
+    "create",
+    "--head",
+    "feature/test",
+    "--base",
+    "main",
+    "--title",
+    "Improve branch push flow",
+    "--body",
+    "## Summary\n- Add PR fields.\n\n## Testing\n- npm test"
+  ]);
+
+  router.dispose();
+});
+
 test("git-merge-base returns merge-base sha", async () => {
   const router = new MessageRouter({ appServer: null, udsClient: null });
   const ws = createMockWs();
@@ -409,6 +516,115 @@ test("git-merge-base returns merge-base sha", async () => {
   assert.equal(envelope.payload.type, "fetch-response");
   assert.deepEqual(JSON.parse(envelope.payload.bodyJsonString), {
     mergeBaseSha: "abc123"
+  });
+
+  router.dispose();
+});
+
+test("git-create-branch creates a branch when missing", async () => {
+  const router = new MessageRouter({ appServer: null, udsClient: null });
+  const ws = createMockWs();
+  const observed = [];
+
+  router._runCommand = async (command, args, options) => {
+    observed.push({ command, args, options });
+    if (command !== "git") {
+      return { ok: false, code: 1, stdout: "", stderr: "unexpected command", error: "unexpected command" };
+    }
+    if (args[2] === "show-ref") {
+      return { ok: false, code: 1, stdout: "", stderr: "", error: null };
+    }
+    if (args[2] === "branch") {
+      return { ok: true, code: 0, stdout: "", stderr: "", error: null };
+    }
+    return { ok: false, code: 1, stdout: "", stderr: "unexpected args", error: "unexpected args" };
+  };
+
+  await router.handleEnvelope(ws, {
+    type: "view-message",
+    payload: {
+      type: "fetch",
+      requestId: "git-create-branch-ok",
+      method: "POST",
+      url: "vscode://codex/git-create-branch",
+      body: JSON.stringify({
+        cwd: "/tmp/repo",
+        branch: "codex/test-branch",
+        mode: "synced"
+      })
+    }
+  });
+
+  assert.deepEqual(observed.map((entry) => entry.args), [
+    ["-C", "/tmp/repo", "show-ref", "--verify", "--quiet", "refs/heads/codex/test-branch"],
+    ["-C", "/tmp/repo", "branch", "codex/test-branch"]
+  ]);
+
+  const envelope = ws.sent[0];
+  assert.equal(envelope.type, "main-message");
+  assert.equal(envelope.payload.type, "fetch-response");
+  assert.equal(envelope.payload.status, 200);
+  assert.deepEqual(JSON.parse(envelope.payload.bodyJsonString), {
+    ok: true,
+    code: 0,
+    branch: "codex/test-branch",
+    created: true,
+    alreadyExists: false,
+    stdout: "",
+    stderr: ""
+  });
+
+  router.dispose();
+});
+
+test("git-checkout-branch checks out requested branch", async () => {
+  const router = new MessageRouter({ appServer: null, udsClient: null });
+  const ws = createMockWs();
+  const observed = [];
+
+  router._runCommand = async (command, args, options) => {
+    observed.push({ command, args, options });
+    if (command !== "git") {
+      return { ok: false, code: 1, stdout: "", stderr: "unexpected command", error: "unexpected command" };
+    }
+    if (args[2] === "checkout") {
+      return { ok: true, code: 0, stdout: "Switched to branch 'codex/test-branch'", stderr: "", error: null };
+    }
+    if (args[2] === "rev-parse") {
+      return { ok: true, code: 0, stdout: "codex/test-branch", stderr: "", error: null };
+    }
+    return { ok: false, code: 1, stdout: "", stderr: "unexpected args", error: "unexpected args" };
+  };
+
+  await router.handleEnvelope(ws, {
+    type: "view-message",
+    payload: {
+      type: "fetch",
+      requestId: "git-checkout-branch-ok",
+      method: "POST",
+      url: "vscode://codex/git-checkout-branch",
+      body: JSON.stringify({
+        cwd: "/tmp/repo",
+        branch: "codex/test-branch"
+      })
+    }
+  });
+
+  assert.deepEqual(observed.map((entry) => entry.args), [
+    ["-C", "/tmp/repo", "checkout", "codex/test-branch"],
+    ["-C", "/tmp/repo", "rev-parse", "--abbrev-ref", "HEAD"]
+  ]);
+
+  const envelope = ws.sent[0];
+  assert.equal(envelope.type, "main-message");
+  assert.equal(envelope.payload.type, "fetch-response");
+  assert.equal(envelope.payload.status, 200);
+  assert.deepEqual(JSON.parse(envelope.payload.bodyJsonString), {
+    ok: true,
+    code: 0,
+    branch: "codex/test-branch",
+    stdout: "Switched to branch 'codex/test-branch'",
+    stderr: ""
   });
 
   router.dispose();
@@ -463,6 +679,65 @@ test("git-push executes git and returns success payload", async () => {
   router.dispose();
 });
 
+test("git-push supports refspec and upstream setup from branch workflow", async () => {
+  const router = new MessageRouter({ appServer: null, udsClient: null });
+  const ws = createMockWs();
+
+  let observed = null;
+  router._runCommand = async (command, args, options) => {
+    observed = { command, args, options };
+    return {
+      ok: true,
+      code: 0,
+      stdout: "done",
+      stderr: "",
+      error: null
+    };
+  };
+
+  await router.handleEnvelope(ws, {
+    type: "view-message",
+    payload: {
+      type: "fetch",
+      requestId: "git-push-refspec",
+      method: "POST",
+      url: "vscode://codex/git-push",
+      body: JSON.stringify({
+        params: {
+          cwd: "/tmp/repo",
+          force: true,
+          setUpstream: true,
+          refspec: "HEAD:refs/heads/codex/feature"
+        }
+      })
+    }
+  });
+
+  assert.deepEqual(observed?.command, "git");
+  assert.deepEqual(observed?.args, [
+    "-C",
+    "/tmp/repo",
+    "push",
+    "--force-with-lease",
+    "--set-upstream",
+    "origin",
+    "HEAD:refs/heads/codex/feature"
+  ]);
+
+  const envelope = ws.sent[0];
+  assert.equal(envelope.type, "main-message");
+  assert.equal(envelope.payload.type, "fetch-response");
+  assert.equal(envelope.payload.status, 200);
+  assert.deepEqual(JSON.parse(envelope.payload.bodyJsonString), {
+    ok: true,
+    code: 0,
+    stdout: "done",
+    stderr: ""
+  });
+
+  router.dispose();
+});
+
 test("git-push failure returns non-2xx response", async () => {
   const router = new MessageRouter({ appServer: null, udsClient: null });
   const ws = createMockWs();
@@ -500,6 +775,33 @@ test("git-push failure returns non-2xx response", async () => {
   assert.equal(parsed.ok, false);
   assert.equal(parsed.code, 1);
   assert.match(parsed.error, /push destination/i);
+
+  router.dispose();
+});
+
+test("unknown git fetch endpoint returns 500 error", async () => {
+  const router = new MessageRouter({ appServer: null, udsClient: null });
+  const ws = createMockWs();
+
+  await router.handleEnvelope(ws, {
+    type: "view-message",
+    payload: {
+      type: "fetch",
+      requestId: "git-unknown",
+      method: "POST",
+      url: "vscode://codex/git-unknown-endpoint",
+      body: JSON.stringify({})
+    }
+  });
+
+  const envelope = ws.sent[0];
+  assert.equal(envelope.type, "main-message");
+  assert.equal(envelope.payload.type, "fetch-response");
+  assert.equal(envelope.payload.status, 500);
+  assert.deepEqual(JSON.parse(envelope.payload.bodyJsonString), {
+    ok: false,
+    error: "unhandled git endpoint: git-unknown-endpoint"
+  });
 
   router.dispose();
 });
