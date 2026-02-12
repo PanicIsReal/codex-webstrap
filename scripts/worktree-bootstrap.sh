@@ -193,7 +193,8 @@ detect_source_checkout() {
 
   local current="$TARGET"
   local candidate
-  local first_non_current=""
+  local first_non_current_with_no_core=""
+  local saw_non_current=0
   for candidate in "${worktree_paths[@]}"; do
     local candidate_abs=""
     if [[ -d "$candidate" ]]; then
@@ -201,14 +202,18 @@ detect_source_checkout() {
     fi
     [[ -n "$candidate_abs" ]] || continue
     [[ "$candidate_abs" == "$current" ]] && continue
-    if [[ -z "$first_non_current" ]]; then
-      first_non_current="$candidate_abs"
-    fi
+    saw_non_current=1
 
     local has_core=0
+    local has_symlink_core=0
     local rel
     for rel in "${CORE_PATHS[@]}"; do
-      if [[ -e "$candidate_abs/$rel" || -L "$candidate_abs/$rel" ]]; then
+      if [[ -L "$candidate_abs/$rel" ]]; then
+        has_symlink_core=1
+        continue
+      fi
+
+      if [[ -e "$candidate_abs/$rel" ]]; then
         has_core=1
         break
       fi
@@ -219,11 +224,26 @@ detect_source_checkout() {
       action_log "INFO" "Auto-detected source checkout: $SOURCE"
       return
     fi
+
+    if [[ "$has_symlink_core" -eq 1 ]]; then
+      action_log "WARN" "Skipping source candidate with symlink-only core paths: $candidate_abs"
+      continue
+    fi
+
+    if [[ -z "$first_non_current_with_no_core" ]]; then
+      first_non_current_with_no_core="$candidate_abs"
+    fi
   done
 
-  if [[ -n "$first_non_current" ]]; then
-    SOURCE="$first_non_current"
+  if [[ -n "$first_non_current_with_no_core" ]]; then
+    SOURCE="$first_non_current_with_no_core"
     action_log "WARN" "No source checkout found with core paths; using first non-current worktree: $SOURCE"
+    return
+  fi
+
+  if [[ "$saw_non_current" -eq 1 ]]; then
+    SOURCE=""
+    action_log "WARN" "No safe source checkout found (candidates only had symlinked core paths); skipping source sync."
     return
   fi
 
