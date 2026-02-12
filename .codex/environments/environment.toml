@@ -3,4 +3,4 @@ version = 1
 name = "codex-webstrapper"
 
 [setup]
-script = "./scripts/worktree-bootstrap.sh --mode symlink --overwrite backup --extras on"
+script = "./scripts/worktree-bootstrap.sh --mode symlink --overwrite backup --extras on --install on --checks on"
