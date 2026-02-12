@@ -17,8 +17,19 @@ OPEN_FLAG="0"
 TOKEN_FILE="${CODEX_WEBSTRAP_TOKEN_FILE:-}"
 CODEX_APP="${CODEX_WEBSTRAP_CODEX_APP:-}"
 INTERNAL_WS_PORT="${CODEX_WEBSTRAP_INTERNAL_WS_PORT:-38080}"
+PORT_SET="0"
+BIND_SET="0"
 COPY_FLAG="0"
 COMMAND="serve"
+
+# Treat non-empty env overrides as explicit selections so open-mode runtime
+# autodetection cannot replace them.
+if [[ -n "${CODEX_WEBSTRAP_PORT:-}" ]]; then
+  PORT_SET="1"
+fi
+if [[ -n "${CODEX_WEBSTRAP_BIND:-}" ]]; then
+  BIND_SET="1"
+fi
 
 DEFAULT_TOKEN_FILE="${HOME}/.codex-webstrap/token"
 if [[ -z "$TOKEN_FILE" ]]; then
@@ -70,14 +81,20 @@ fi
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    open)
+      COMMAND="open"
+      shift
+      ;;
     --port)
       require_value "$1" "${2:-}"
       PORT="$2"
+      PORT_SET="1"
       shift 2
       ;;
     --bind)
       require_value "$1" "${2:-}"
       BIND="$2"
+      BIND_SET="1"
       shift 2
       ;;
     --token-file)
@@ -126,6 +143,36 @@ if [[ "$COMMAND" == "open" ]]; then
     exit 1
   fi
 
+  if [[ "$PORT_SET" == "0" || "$BIND_SET" == "0" ]]; then
+    RUNTIME_FILE="${TOKEN_FILE}.runtime"
+    if [[ -f "$RUNTIME_FILE" ]]; then
+      RUNTIME_VALUES="$(node -e 'const fs = require("node:fs"); const filePath = process.argv[2]; try { const data = JSON.parse(fs.readFileSync(filePath, "utf8")); const bind = data.bind || ""; const port = data.port || ""; if (!bind || !port) { process.exit(1); } process.stdout.write(`${bind}\n${port}\n`); } catch { process.exit(1); }' "$TOKEN_FILE" "$RUNTIME_FILE" 2>/dev/null || true)"
+      if [[ -n "$RUNTIME_VALUES" ]]; then
+        RUNTIME_BIND="$(printf '%s' "$RUNTIME_VALUES" | sed -n '1p')"
+        RUNTIME_PORT="$(printf '%s' "$RUNTIME_VALUES" | sed -n '2p')"
+        if [[ -n "$RUNTIME_BIND" && -n "$RUNTIME_PORT" ]]; then
+          if command -v curl >/dev/null 2>&1; then
+            if curl -fsS --max-time 1 --connect-timeout 1 "http://${RUNTIME_BIND}:${RUNTIME_PORT}/__webstrapper/healthz" >/dev/null 2>&1; then
+              if [[ "$BIND_SET" == "0" ]]; then
+                BIND="$RUNTIME_BIND"
+              fi
+              if [[ "$PORT_SET" == "0" ]]; then
+                PORT="$RUNTIME_PORT"
+              fi
+            fi
+          else
+            if [[ "$BIND_SET" == "0" ]]; then
+              BIND="$RUNTIME_BIND"
+            fi
+            if [[ "$PORT_SET" == "0" ]]; then
+              PORT="$RUNTIME_PORT"
+            fi
+          fi
+        fi
+      fi
+    fi
+  fi
+
   ENCODED_TOKEN="$(node -e 'process.stdout.write(encodeURIComponent(process.argv[1] || ""))' "$TOKEN")"
   AUTH_URL="http://${BIND}:${PORT}/__webstrapper/auth?token=${ENCODED_TOKEN}"
 
@@ -134,9 +181,8 @@ if [[ "$COMMAND" == "open" ]]; then
       echo "pbcopy not found in PATH" >&2
       exit 1
     fi
-    printf '%s' "$AUTH_URL" | pbcopy
+    printf '%s' "$AUTH_URL" | pbcopy >/dev/null 2>&1
     printf 'Copied auth URL to clipboard.\n'
-    printf '%s\n' "$AUTH_URL"
   else
     open "$AUTH_URL"
     printf 'Opened auth URL in browser.\n'
