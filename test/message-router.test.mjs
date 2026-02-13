@@ -216,6 +216,114 @@ test("terminal-attach returns metadata and init log for existing session", async
   router.dispose();
 });
 
+test("terminal-attach without explicit dimensions does not force bun-pty resize", async () => {
+  const router = new MessageRouter({ appServer: null, udsClient: null });
+  const creator = createMockWs();
+  const attacher = createMockWs();
+  const sessionId = "terminal-attach-no-resize";
+  const resizeCommands = [];
+
+  const fakeProc = {
+    stdin: {
+      destroyed: false,
+      write(value) {
+        resizeCommands.push(value);
+      }
+    },
+    stdout: { on() {} },
+    stderr: { on() {} },
+    on() {},
+    killed: false,
+    kill() {
+      this.killed = true;
+    }
+  };
+
+  router.terminals.sessions.set(sessionId, {
+    sessionId,
+    mode: "bun-pty",
+    proc: fakeProc,
+    bunStdoutBuffer: "",
+    listeners: new Set([creator]),
+    cwd: process.cwd(),
+    shell: process.execPath,
+    attachLog: "Terminal attached via codex-webstrapper (bun-pty)\r\n",
+    cols: 120,
+    rows: 30
+  });
+
+  router.terminals.createOrAttach(attacher, {
+    type: "terminal-attach",
+    sessionId
+  });
+
+  assert.equal(
+    resizeCommands.some((entry) => String(entry).includes("\"type\":\"resize\"")),
+    false
+  );
+
+  router.dispose();
+});
+
+test("terminal-attach with explicit dimensions forwards bun-pty resize", async () => {
+  const router = new MessageRouter({ appServer: null, udsClient: null });
+  const creator = createMockWs();
+  const attacher = createMockWs();
+  const sessionId = "terminal-attach-with-resize";
+  const commands = [];
+
+  const fakeProc = {
+    stdin: {
+      destroyed: false,
+      write(value) {
+        commands.push(value);
+      }
+    },
+    stdout: { on() {} },
+    stderr: { on() {} },
+    on() {},
+    killed: false,
+    kill() {
+      this.killed = true;
+    }
+  };
+
+  router.terminals.sessions.set(sessionId, {
+    sessionId,
+    mode: "bun-pty",
+    proc: fakeProc,
+    bunStdoutBuffer: "",
+    listeners: new Set([creator]),
+    cwd: process.cwd(),
+    shell: process.execPath,
+    attachLog: "Terminal attached via codex-webstrapper (bun-pty)\r\n",
+    cols: 120,
+    rows: 30
+  });
+
+  router.terminals.createOrAttach(attacher, {
+    type: "terminal-attach",
+    sessionId,
+    cols: 200,
+    rows: 60
+  });
+
+  const resizePayload = commands
+    .map((entry) => {
+      try {
+        return JSON.parse(String(entry).trim());
+      } catch {
+        return null;
+      }
+    })
+    .find((entry) => entry?.type === "resize");
+  assert.ok(resizePayload);
+  assert.equal(resizePayload.cols, 200);
+  assert.equal(resizePayload.rows, 60);
+
+  router.dispose();
+});
+
 test("ready emits host_config shared object update", async () => {
   const hostConfig = {
     id: "ssh-host-1",
@@ -399,6 +507,94 @@ test("transcribe fetch decodes X-Codex-Base64 and forwards to OpenAI transcripti
   assert.equal(envelope.payload.type, "fetch-response");
   assert.equal(envelope.payload.status, 200);
   assert.deepEqual(JSON.parse(envelope.payload.bodyJsonString), { text: "ok" });
+});
+
+test("cancel-fetch aborts in-flight /transcribe request", async (t) => {
+  const appServer = {
+    on() {},
+    getState() {
+      return { connected: true, initialized: true, transportKind: "stdio" };
+    },
+    async sendRequest(method) {
+      if (method !== "getAuthStatus") {
+        throw new Error(`unexpected app-server method: ${method}`);
+      }
+      return {
+        result: {
+          authToken: "test-auth-token"
+        }
+      };
+    }
+  };
+
+  const router = new MessageRouter({ appServer, udsClient: null });
+  const ws = createMockWs();
+  const originalFetch = globalThis.fetch;
+  const boundary = "cancel-b";
+  const payload = Buffer.from("audio-bytes", "utf8");
+  const multipartBody = Buffer.concat([
+    Buffer.from(`--${boundary}\r\n`),
+    Buffer.from("Content-Disposition: form-data; name=\"file\"; filename=\"clip.webm\"\r\n"),
+    Buffer.from("Content-Type: audio/webm\r\n\r\n"),
+    payload,
+    Buffer.from("\r\n"),
+    Buffer.from(`--${boundary}--\r\n`)
+  ]);
+  const payloadBase64 = multipartBody.toString("base64");
+  let observedSignal = null;
+
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+    router.dispose();
+  });
+
+  globalThis.fetch = async (_url, init) => {
+    observedSignal = init?.signal || null;
+    return await new Promise((_resolve, reject) => {
+      observedSignal?.addEventListener("abort", () => {
+        reject(new Error("aborted"));
+      });
+    });
+  };
+
+  const inFlight = router.handleEnvelope(ws, {
+    type: "view-message",
+    payload: {
+      type: "fetch",
+      requestId: "transcribe-cancel",
+      method: "POST",
+      url: "/transcribe",
+      headers: {
+        "Content-Type": `multipart/form-data; boundary=${boundary}`,
+        "X-Codex-Base64": "1"
+      },
+      body: payloadBase64
+    }
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  await router.handleEnvelope(ws, {
+    type: "view-message",
+    payload: {
+      type: "cancel-fetch",
+      requestId: "transcribe-cancel"
+    }
+  });
+
+  await inFlight;
+
+  assert.ok(observedSignal);
+  assert.equal(observedSignal.aborted, true);
+  assert.equal(router.fetchControllers.has("transcribe-cancel"), false);
+
+  const responseEnvelope = ws.sent.find((entry) => (
+    entry.type === "main-message"
+    && entry.payload?.type === "fetch-response"
+    && entry.payload?.requestId === "transcribe-cancel"
+  ));
+  assert.ok(responseEnvelope);
+  assert.equal(responseEnvelope.payload.responseType, "error");
 });
 
 test("local-environments lists workspace environment configs", async (t) => {

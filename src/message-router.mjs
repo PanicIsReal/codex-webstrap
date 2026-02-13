@@ -100,7 +100,9 @@ class TerminalRegistry {
         sessionId,
         log: existing.attachLog
       });
-      this.resize(sessionId, message?.cols, message?.rows);
+      if (this._hasExplicitDimensions(message)) {
+        this.resize(sessionId, message.cols, message.rows);
+      }
       return;
     }
 
@@ -136,6 +138,8 @@ class TerminalRegistry {
       cwd: launchConfig.cwd,
       shell: launchConfig.shell,
       attachLog,
+      cols: runtime.cols ?? this._coerceDimension(message?.cols, 120),
+      rows: runtime.rows ?? this._coerceDimension(message?.rows, 30),
       ...runtime
     };
 
@@ -238,11 +242,15 @@ class TerminalRegistry {
 
     if (session.mode === "bun-pty") {
       try {
+        const nextCols = this._coerceDimension(cols, session.cols || 120);
+        const nextRows = this._coerceDimension(rows, session.rows || 30);
         this._writeToBunPty(session, {
           type: "resize",
-          cols: this._coerceDimension(cols, 120),
-          rows: this._coerceDimension(rows, 30)
+          cols: nextCols,
+          rows: nextRows
         });
+        session.cols = nextCols;
+        session.rows = nextRows;
       } catch (error) {
         this._broadcast(sessionId, {
           type: "terminal-error",
@@ -363,7 +371,9 @@ class TerminalRegistry {
 
     return {
       mode: "pipe",
-      proc
+      proc,
+      cols: this._coerceDimension(message?.cols, 120),
+      rows: this._coerceDimension(message?.rows, 30)
     };
   }
 
@@ -375,13 +385,15 @@ class TerminalRegistry {
     const [bin, ...args] = launchConfig.command;
     try {
       const bridgePath = fileURLToPath(new URL("./bun-pty-bridge.mjs", import.meta.url));
+      const initialCols = this._coerceDimension(message?.cols, 120);
+      const initialRows = this._coerceDimension(message?.rows, 30);
       const config = JSON.stringify({
         file: bin,
         args,
         cwd: launchConfig.cwd,
         env: launchConfig.env,
-        cols: this._coerceDimension(message?.cols, 120),
-        rows: this._coerceDimension(message?.rows, 30),
+        cols: initialCols,
+        rows: initialRows,
         term: launchConfig.env.TERM || "xterm-256color"
       });
 
@@ -397,7 +409,9 @@ class TerminalRegistry {
       return {
         mode: "bun-pty",
         proc,
-        bunStdoutBuffer: ""
+        bunStdoutBuffer: "",
+        cols: initialCols,
+        rows: initialRows
       };
     } catch (error) {
       this.bunPtyAvailable = false;
@@ -434,7 +448,9 @@ class TerminalRegistry {
       );
       return {
         mode: "python-pty",
-        proc
+        proc,
+        cols: 120,
+        rows: 30
       };
     } catch (error) {
       this.pythonPtyAvailable = false;
@@ -646,6 +662,12 @@ class TerminalRegistry {
       return fallback;
     }
     return Math.max(1, Math.floor(parsed));
+  }
+
+  _hasExplicitDimensions(message) {
+    const cols = Number(message?.cols);
+    const rows = Number(message?.rows);
+    return Number.isFinite(cols) && cols > 0 && Number.isFinite(rows) && rows > 0;
   }
 }
 
@@ -1205,7 +1227,13 @@ export class MessageRouter {
     }
 
     if (typeof message.url === "string" && message.url === "/transcribe") {
-      await this._handleTranscribeFetch(ws, requestId, message);
+      const controller = new AbortController();
+      this.fetchControllers.set(requestId, controller);
+      try {
+        await this._handleTranscribeFetch(ws, requestId, message, controller.signal);
+      } finally {
+        this.fetchControllers.delete(requestId);
+      }
       return;
     }
 
@@ -1283,7 +1311,7 @@ export class MessageRouter {
     }
   }
 
-  async _handleTranscribeFetch(ws, requestId, message) {
+  async _handleTranscribeFetch(ws, requestId, message, signal) {
     try {
       const outbound = this._prepareOutgoingFetchRequest(message);
       const bodyBuffer = this._asBuffer(outbound.body);
@@ -1321,7 +1349,8 @@ export class MessageRouter {
         headers: {
           Authorization: `Bearer ${authToken}`
         },
-        body: form
+        body: form,
+        signal
       });
       const responseText = await response.text();
 
