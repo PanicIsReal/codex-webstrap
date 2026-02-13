@@ -218,6 +218,92 @@ test("virtual vscode fetch endpoints return expected payload shapes", async () =
   router.dispose();
 });
 
+test("transcribe fetch decodes X-Codex-Base64 and forwards to OpenAI transcription API", async (t) => {
+  const appServer = {
+    on() {},
+    getState() {
+      return { connected: true, initialized: true, transportKind: "stdio" };
+    },
+    async sendRequest(method) {
+      if (method !== "getAuthStatus") {
+        throw new Error(`unexpected app-server method: ${method}`);
+      }
+      return {
+        result: {
+          authToken: "test-auth-token"
+        }
+      };
+    }
+  };
+  const router = new MessageRouter({ appServer, udsClient: null });
+  const ws = createMockWs();
+  const originalFetch = globalThis.fetch;
+  const boundary = "abc";
+  const payload = Buffer.from("audio-bytes", "utf8");
+  const multipartBody = Buffer.concat([
+    Buffer.from(`--${boundary}\r\n`),
+    Buffer.from("Content-Disposition: form-data; name=\"file\"; filename=\"clip.webm\"\r\n"),
+    Buffer.from("Content-Type: audio/webm\r\n\r\n"),
+    payload,
+    Buffer.from("\r\n"),
+    Buffer.from(`--${boundary}\r\n`),
+    Buffer.from("Content-Disposition: form-data; name=\"language\"\r\n\r\n"),
+    Buffer.from("en"),
+    Buffer.from("\r\n"),
+    Buffer.from(`--${boundary}--\r\n`)
+  ]);
+  const payloadBase64 = multipartBody.toString("base64");
+  let observedUrl = null;
+  let observedInit = null;
+
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+    router.dispose();
+  });
+
+  globalThis.fetch = async (url, init) => {
+    observedUrl = url;
+    observedInit = init;
+    return new Response(JSON.stringify({ text: "ok" }), {
+      status: 200,
+      headers: {
+        "content-type": "application/json"
+      }
+    });
+  };
+
+  await router.handleEnvelope(ws, {
+    type: "view-message",
+    payload: {
+      type: "fetch",
+      requestId: "transcribe-b64",
+      method: "POST",
+      url: "/transcribe",
+      headers: {
+        "Content-Type": `multipart/form-data; boundary=${boundary}`,
+        "X-Codex-Base64": "1"
+      },
+      body: payloadBase64
+    }
+  });
+
+  assert.equal(observedUrl, "https://api.openai.com/v1/audio/transcriptions");
+  assert.equal(observedInit?.headers?.Authorization, "Bearer test-auth-token");
+  assert.ok(observedInit?.body instanceof FormData);
+  assert.equal(observedInit.body.get("model"), "gpt-4o-mini-transcribe");
+  assert.equal(observedInit.body.get("language"), "en");
+  const file = observedInit.body.get("file");
+  assert.equal(file?.name, "clip.webm");
+  assert.equal(file?.type, "audio/webm");
+  assert.equal(Buffer.from(await file.arrayBuffer()).toString("utf8"), "audio-bytes");
+
+  const envelope = ws.sent[0];
+  assert.equal(envelope.type, "main-message");
+  assert.equal(envelope.payload.type, "fetch-response");
+  assert.equal(envelope.payload.status, 200);
+  assert.deepEqual(JSON.parse(envelope.payload.bodyJsonString), { text: "ok" });
+});
+
 test("local-environments lists workspace environment configs", async (t) => {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "cw-local-envs-"));
   t.after(async () => {

@@ -753,11 +753,16 @@ export class MessageRouter {
     this.logger.debug("renderer-fetch", {
       requestId,
       method: message.method || "GET",
-      url: message.url || null,
-      body: typeof message.body === "string" ? message.body.slice(0, 400) : null
+      url: this._sanitizeUrlForLogs(message.url),
+      hasBody: message.body != null
     });
 
     if (await this._handleVirtualFetch(ws, requestId, message)) {
+      return;
+    }
+
+    if (typeof message.url === "string" && message.url === "/transcribe") {
+      await this._handleTranscribeFetch(ws, requestId, message);
       return;
     }
 
@@ -772,7 +777,7 @@ export class MessageRouter {
       });
       this.logger.warn("renderer-fetch-failed", {
         requestId,
-        url: message.url || null,
+        url: this._sanitizeUrlForLogs(message.url),
         error: "unsupported_fetch_url"
       });
       return;
@@ -782,10 +787,11 @@ export class MessageRouter {
     this.fetchControllers.set(requestId, controller);
 
     try {
+      const outbound = this._prepareOutgoingFetchRequest(message);
       const response = await fetch(resolvedUrl, {
-        method: message.method || "GET",
-        headers: message.headers || {},
-        body: message.body,
+        method: outbound.method,
+        headers: outbound.headers,
+        body: outbound.body,
         signal: controller.signal
       });
 
@@ -814,7 +820,7 @@ export class MessageRouter {
         requestId,
         status: response.status,
         ok: response.ok,
-        url: response.url || resolvedUrl
+        url: this._sanitizeUrlForLogs(response.url || resolvedUrl)
       });
     } catch (error) {
       this.sendMainMessage(ws, {
@@ -826,12 +832,276 @@ export class MessageRouter {
       });
       this.logger.warn("renderer-fetch-failed", {
         requestId,
-        url: resolvedUrl,
+        url: this._sanitizeUrlForLogs(resolvedUrl),
         error: toErrorMessage(error)
       });
     } finally {
       this.fetchControllers.delete(requestId);
     }
+  }
+
+  async _handleTranscribeFetch(ws, requestId, message) {
+    try {
+      const outbound = this._prepareOutgoingFetchRequest(message);
+      const bodyBuffer = this._asBuffer(outbound.body);
+      const contentType = this._readHeader(outbound.headers, "content-type");
+      const boundary = this._extractMultipartBoundary(contentType);
+      if (!boundary) {
+        throw new Error("Missing multipart boundary for /transcribe request.");
+      }
+
+      const { fields, files } = this._parseMultipartBody(bodyBuffer, boundary);
+      const file = files.find((part) => part.name === "file") || files[0];
+      if (!file || !file.data || file.data.length === 0) {
+        throw new Error("Missing audio file in /transcribe request.");
+      }
+
+      const authToken = await this._resolveTranscriptionAuthToken();
+      if (!authToken) {
+        throw new Error("Dictation requires ChatGPT authentication in Codex.");
+      }
+
+      const model = process.env.CODEX_WEBSTRAP_TRANSCRIBE_MODEL || "gpt-4o-mini-transcribe";
+      const form = new FormData();
+      form.append("model", model);
+      if (typeof fields.language === "string" && fields.language.trim().length > 0) {
+        form.append("language", fields.language.trim());
+      }
+      form.append(
+        "file",
+        new Blob([file.data], { type: file.contentType || "audio/webm" }),
+        file.filename || "codex.webm"
+      );
+
+      const response = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${authToken}`
+        },
+        body: form
+      });
+      const responseText = await response.text();
+
+      let bodyJsonString = responseText;
+      if (response.ok) {
+        const parsed = safeJsonParse(responseText);
+        if (parsed && typeof parsed === "object" && typeof parsed.text === "string") {
+          bodyJsonString = JSON.stringify({ text: parsed.text });
+        } else {
+          bodyJsonString = JSON.stringify({ text: "" });
+        }
+      }
+
+      this.sendMainMessage(ws, {
+        type: "fetch-response",
+        requestId,
+        responseType: "success",
+        status: response.status,
+        headers: {
+          "content-type": response.headers.get("content-type") || "application/json"
+        },
+        bodyJsonString
+      });
+    } catch (error) {
+      this.sendMainMessage(ws, {
+        type: "fetch-response",
+        requestId,
+        responseType: "error",
+        status: 0,
+        error: toErrorMessage(error)
+      });
+      this.logger.warn("transcribe-fetch-failed", {
+        requestId,
+        error: toErrorMessage(error)
+      });
+    }
+  }
+
+  _prepareOutgoingFetchRequest(message) {
+    const method = message?.method || "GET";
+    const headers = message?.headers && typeof message.headers === "object"
+      ? { ...message.headers }
+      : {};
+    let body = message?.body;
+
+    const base64Marker = this._readHeader(headers, "x-codex-base64");
+    if (base64Marker === "1") {
+      this._deleteHeader(headers, "x-codex-base64");
+      if (typeof body !== "string") {
+        throw new Error("X-Codex-Base64 fetch body must be a base64 string.");
+      }
+      body = Buffer.from(body, "base64");
+    }
+
+    return {
+      method,
+      headers,
+      body
+    };
+  }
+
+  _asBuffer(body) {
+    if (Buffer.isBuffer(body)) {
+      return body;
+    }
+    if (body instanceof Uint8Array) {
+      return Buffer.from(body);
+    }
+    if (typeof body === "string") {
+      return Buffer.from(body, "utf8");
+    }
+    if (body == null) {
+      return Buffer.alloc(0);
+    }
+    return Buffer.from(String(body), "utf8");
+  }
+
+  _extractMultipartBoundary(contentType) {
+    if (typeof contentType !== "string") {
+      return null;
+    }
+    const match = contentType.match(/boundary=([^;]+)/i);
+    if (!match || !match[1]) {
+      return null;
+    }
+    return match[1].trim().replace(/^"|"$/g, "");
+  }
+
+  _parseMultipartBody(body, boundary) {
+    const files = [];
+    const fields = {};
+    const delimiter = Buffer.from(`--${boundary}`);
+    const partSeparator = Buffer.from("\r\n\r\n");
+
+    let cursor = 0;
+    for (;;) {
+      const start = body.indexOf(delimiter, cursor);
+      if (start < 0) {
+        break;
+      }
+
+      cursor = start + delimiter.length;
+      if (body[cursor] === 45 && body[cursor + 1] === 45) {
+        break;
+      }
+      if (body[cursor] === 13 && body[cursor + 1] === 10) {
+        cursor += 2;
+      }
+
+      const headerEnd = body.indexOf(partSeparator, cursor);
+      if (headerEnd < 0) {
+        break;
+      }
+
+      const headersText = body.slice(cursor, headerEnd).toString("utf8");
+      const contentStart = headerEnd + partSeparator.length;
+      const nextBoundary = body.indexOf(Buffer.from(`\r\n--${boundary}`), contentStart);
+      const contentEnd = nextBoundary >= 0 ? nextBoundary : body.length;
+      const content = body.slice(contentStart, contentEnd);
+
+      const headers = {};
+      for (const line of headersText.split("\r\n")) {
+        const splitAt = line.indexOf(":");
+        if (splitAt <= 0) {
+          continue;
+        }
+        const key = line.slice(0, splitAt).trim().toLowerCase();
+        const value = line.slice(splitAt + 1).trim();
+        headers[key] = value;
+      }
+
+      const disposition = headers["content-disposition"] || "";
+      const nameMatch = disposition.match(/\bname="([^"]+)"/i);
+      const filenameMatch = disposition.match(/\bfilename="([^"]+)"/i);
+      const name = nameMatch ? nameMatch[1] : null;
+      const filename = filenameMatch ? filenameMatch[1] : null;
+      const part = {
+        name,
+        filename,
+        contentType: headers["content-type"] || null,
+        data: content
+      };
+
+      if (filename) {
+        files.push(part);
+      } else if (name) {
+        fields[name] = content.toString("utf8");
+      }
+
+      cursor = contentEnd + 2;
+    }
+
+    return { fields, files };
+  }
+
+  async _resolveTranscriptionAuthToken() {
+    if (!this.appServer) {
+      return null;
+    }
+    try {
+      const response = await this.appServer.sendRequest("getAuthStatus", {
+        includeToken: true,
+        refreshToken: true
+      }, {
+        timeoutMs: 10_000
+      });
+      const token = response?.result?.authToken;
+      return typeof token === "string" && token.trim().length > 0 ? token.trim() : null;
+    } catch (error) {
+      this.logger.warn("Failed to resolve transcription auth token", {
+        error: toErrorMessage(error)
+      });
+      return null;
+    }
+  }
+
+  _readHeader(headers, name) {
+    if (!headers || typeof headers !== "object") {
+      return null;
+    }
+
+    const target = String(name).toLowerCase();
+    for (const [key, value] of Object.entries(headers)) {
+      if (String(key).toLowerCase() !== target) {
+        continue;
+      }
+      if (Array.isArray(value)) {
+        return value.length > 0 ? String(value[0]) : "";
+      }
+      return value == null ? null : String(value);
+    }
+    return null;
+  }
+
+  _deleteHeader(headers, name) {
+    if (!headers || typeof headers !== "object") {
+      return;
+    }
+
+    const target = String(name).toLowerCase();
+    for (const key of Object.keys(headers)) {
+      if (String(key).toLowerCase() === target) {
+        delete headers[key];
+      }
+    }
+  }
+
+  _sanitizeUrlForLogs(url) {
+    if (typeof url !== "string" || url.length === 0) {
+      return null;
+    }
+
+    // Drop query params and fragments from logs to avoid leaking tokens/user data.
+    const withoutQuery = url.split("?")[0]?.split("#")[0] ?? "";
+    if (withoutQuery.startsWith("http://") || withoutQuery.startsWith("https://")) {
+      try {
+        const parsed = new URL(withoutQuery);
+        return `${parsed.origin}${parsed.pathname}`;
+      } catch {
+        return withoutQuery;
+      }
+    }
+    return withoutQuery;
   }
 
   _resolveFetchUrl(url) {
@@ -1958,7 +2228,7 @@ export class MessageRouter {
       requestId,
       status,
       ok: status >= 200 && status < 300,
-      url
+      url: this._sanitizeUrlForLogs(url)
     });
   }
 
