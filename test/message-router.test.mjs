@@ -119,6 +119,103 @@ test("show-context-menu is safely ignored", async () => {
   router.dispose();
 });
 
+test("terminal-create falls back when cwd is invalid", async () => {
+  const router = new MessageRouter({ appServer: null, udsClient: null });
+  const ws = createMockWs();
+  const sessionId = "terminal-fallback-cwd";
+
+  await router.handleEnvelope(ws, {
+    type: "view-message",
+    payload: {
+      type: "terminal-create",
+      sessionId,
+      cwd: "/definitely/not/a/real/directory",
+      command: [process.execPath, "-e", "setTimeout(() => process.exit(0), 50)"]
+    }
+  });
+
+  const attached = ws.sent.find((entry) => (
+    entry.type === "main-message"
+    && entry.payload?.type === "terminal-attached"
+    && entry.payload?.sessionId === sessionId
+  ));
+  assert.ok(attached);
+  assert.equal(attached.payload.cwd, process.cwd());
+  assert.equal(attached.payload.shell, process.execPath);
+
+  const initLog = ws.sent.find((entry) => (
+    entry.type === "main-message"
+    && entry.payload?.type === "terminal-init-log"
+    && entry.payload?.sessionId === sessionId
+  ));
+  assert.ok(initLog);
+  assert.match(initLog.payload.log, /Requested cwd unavailable/);
+
+  await router.handleEnvelope(ws, {
+    type: "view-message",
+    payload: {
+      type: "terminal-close",
+      sessionId
+    }
+  });
+
+  router.dispose();
+});
+
+test("terminal-attach returns metadata and init log for existing session", async () => {
+  const router = new MessageRouter({ appServer: null, udsClient: null });
+  const creator = createMockWs();
+  const attacher = createMockWs();
+  const sessionId = "terminal-attach-replay";
+
+  await router.handleEnvelope(creator, {
+    type: "view-message",
+    payload: {
+      type: "terminal-create",
+      sessionId,
+      cwd: process.cwd(),
+      command: [process.execPath, "-e", "setTimeout(() => {}, 5000)"]
+    }
+  });
+
+  creator.sent = [];
+
+  await router.handleEnvelope(attacher, {
+    type: "view-message",
+    payload: {
+      type: "terminal-attach",
+      sessionId
+    }
+  });
+
+  const attached = attacher.sent.find((entry) => (
+    entry.type === "main-message"
+    && entry.payload?.type === "terminal-attached"
+    && entry.payload?.sessionId === sessionId
+  ));
+  assert.ok(attached);
+  assert.equal(attached.payload.cwd, process.cwd());
+  assert.equal(attached.payload.shell, process.execPath);
+
+  const initLog = attacher.sent.find((entry) => (
+    entry.type === "main-message"
+    && entry.payload?.type === "terminal-init-log"
+    && entry.payload?.sessionId === sessionId
+  ));
+  assert.ok(initLog);
+  assert.match(initLog.payload.log, /Terminal attached via codex-webstrapper/);
+
+  await router.handleEnvelope(creator, {
+    type: "view-message",
+    payload: {
+      type: "terminal-close",
+      sessionId
+    }
+  });
+
+  router.dispose();
+});
+
 test("ready emits host_config shared object update", async () => {
   const hostConfig = {
     id: "ssh-host-1",

@@ -1,9 +1,10 @@
-import { spawn } from "node:child_process";
+import { spawn as childSpawn, spawnSync as childSpawnSync } from "node:child_process";
 import { Worker } from "node:worker_threads";
 import os from "node:os";
 import path from "node:path";
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import fs from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 
 import { createLogger, randomId, safeJsonParse, toErrorMessage } from "./util.mjs";
 
@@ -76,6 +77,11 @@ class TerminalRegistry {
     this.sendToWs = sendToWs;
     this.logger = logger;
     this.sessions = new Map();
+    this.bunPtyAvailable = this._detectBunPtyAvailability();
+    this.loggedBunPtyFailure = false;
+    this.pythonPtyAvailable = this._detectPythonPtyAvailability();
+    this.loggedPythonPtyFailure = false;
+    this.hasPtyLikeRuntime = this.bunPtyAvailable || this.pythonPtyAvailable;
   }
 
   createOrAttach(ws, message) {
@@ -83,41 +89,76 @@ class TerminalRegistry {
     const existing = this.sessions.get(sessionId);
     if (existing) {
       existing.listeners.add(ws);
-      this.sendToWs(ws, { type: "terminal-attached", sessionId });
+      this.sendToWs(ws, {
+        type: "terminal-attached",
+        sessionId,
+        cwd: existing.cwd,
+        shell: existing.shell
+      });
+      this.sendToWs(ws, {
+        type: "terminal-init-log",
+        sessionId,
+        log: existing.attachLog
+      });
+      this.resize(sessionId, message?.cols, message?.rows);
       return;
     }
 
-    const shell = process.env.SHELL || "/bin/zsh";
-    const command = Array.isArray(message.command) && message.command.length > 0
-      ? message.command
-      : [shell];
+    const launchConfig = this._resolveLaunchConfig(message);
+    let runtime;
+    try {
+      runtime = this._spawnRuntime(launchConfig, message);
+    } catch (error) {
+      this.sendToWs(ws, {
+        type: "terminal-error",
+        sessionId,
+        message: toErrorMessage(error)
+      });
+      this.logger.warn("Terminal spawn failed", {
+        sessionId,
+        error: toErrorMessage(error)
+      });
+      return;
+    }
 
-    const [bin, ...args] = command;
-    const proc = spawn(bin, args, {
-      cwd: message.cwd || process.cwd(),
-      env: {
-        ...process.env,
-        ...(message.env || {})
-      },
-      stdio: ["pipe", "pipe", "pipe"]
-    });
+    const attachLogLines = [
+      `Terminal attached via codex-webstrapper (${runtime.mode})`
+    ];
+    if (launchConfig.cwdWasFallback && launchConfig.requestedCwd) {
+      attachLogLines.push(`[webstrap] Requested cwd unavailable: ${launchConfig.requestedCwd}`);
+      attachLogLines.push(`[webstrap] Using cwd: ${launchConfig.cwd}`);
+    }
+    const attachLog = `${attachLogLines.join("\r\n")}\r\n`;
 
     const session = {
       sessionId,
-      proc,
-      listeners: new Set([ws])
+      listeners: new Set([ws]),
+      cwd: launchConfig.cwd,
+      shell: launchConfig.shell,
+      attachLog,
+      ...runtime
     };
 
     this.sessions.set(sessionId, session);
 
-    this.sendToWs(ws, { type: "terminal-attached", sessionId });
+    this.sendToWs(ws, {
+      type: "terminal-attached",
+      sessionId,
+      cwd: session.cwd,
+      shell: session.shell
+    });
     this.sendToWs(ws, {
       type: "terminal-init-log",
       sessionId,
-      log: "Terminal attached via codex-webstrapper\r\n"
+      log: session.attachLog
     });
 
-    proc.stdout?.on("data", (chunk) => {
+    if (session.mode === "bun-pty") {
+      this._attachBunPtyProcess(sessionId, session);
+      return;
+    }
+
+    session.proc.stdout?.on("data", (chunk) => {
       this._broadcast(sessionId, {
         type: "terminal-data",
         sessionId,
@@ -125,7 +166,7 @@ class TerminalRegistry {
       });
     });
 
-    proc.stderr?.on("data", (chunk) => {
+    session.proc.stderr?.on("data", (chunk) => {
       this._broadcast(sessionId, {
         type: "terminal-data",
         sessionId,
@@ -133,7 +174,7 @@ class TerminalRegistry {
       });
     });
 
-    proc.on("error", (error) => {
+    session.proc.on("error", (error) => {
       this._broadcast(sessionId, {
         type: "terminal-error",
         sessionId,
@@ -141,7 +182,7 @@ class TerminalRegistry {
       });
     });
 
-    proc.on("exit", (code, signal) => {
+    session.proc.on("exit", (code, signal) => {
       this._broadcast(sessionId, {
         type: "terminal-exit",
         sessionId,
@@ -154,22 +195,91 @@ class TerminalRegistry {
 
   write(sessionId, data) {
     const session = this.sessions.get(sessionId);
-    if (!session || !session.proc.stdin || session.proc.stdin.destroyed) {
+    if (!session) {
       return;
     }
-    session.proc.stdin.write(data);
+
+    if (session.mode === "bun-pty") {
+      try {
+        this._writeToBunPty(session, {
+          type: "write",
+          data
+        });
+      } catch (error) {
+        this._broadcast(sessionId, {
+          type: "terminal-error",
+          sessionId,
+          message: toErrorMessage(error)
+        });
+      }
+      return;
+    }
+
+    if (!session.proc.stdin || session.proc.stdin.destroyed) {
+      return;
+    }
+
+    try {
+      session.proc.stdin.write(data);
+    } catch (error) {
+      this._broadcast(sessionId, {
+        type: "terminal-error",
+        sessionId,
+        message: toErrorMessage(error)
+      });
+    }
   }
 
-  resize(sessionId) {
-    if (!this.sessions.has(sessionId)) {
+  resize(sessionId, cols, rows) {
+    const session = this.sessions.get(sessionId);
+    if (!session) {
       return;
     }
-    this.logger.debug("Terminal resize ignored (non-PTY mode)", { sessionId });
+
+    if (session.mode === "bun-pty") {
+      try {
+        this._writeToBunPty(session, {
+          type: "resize",
+          cols: this._coerceDimension(cols, 120),
+          rows: this._coerceDimension(rows, 30)
+        });
+      } catch (error) {
+        this._broadcast(sessionId, {
+          type: "terminal-error",
+          sessionId,
+          message: toErrorMessage(error)
+        });
+      }
+      return;
+    }
+
+    if (session.mode !== "python-pty") {
+      this.logger.debug("Terminal resize ignored (non-PTY mode)", { sessionId });
+      return;
+    }
   }
 
   close(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session) {
+      return;
+    }
+
+    if (session.mode === "bun-pty") {
+      try {
+        this._writeToBunPty(session, {
+          type: "close"
+        });
+      } catch (error) {
+        this.logger.debug("Bun PTY close command failed", {
+          sessionId,
+          error: toErrorMessage(error)
+        });
+      }
+      if (!session.proc.killed) {
+        session.proc.kill();
+      }
+      this.sessions.delete(sessionId);
       return;
     }
 
@@ -203,6 +313,339 @@ class TerminalRegistry {
     for (const listener of session.listeners) {
       this.sendToWs(listener, message);
     }
+  }
+
+  _resolveLaunchConfig(message) {
+    const requestedCwd = typeof message?.cwd === "string" ? message.cwd.trim() : "";
+    const cwdResult = this._resolveCwd(requestedCwd);
+
+    const commandFromMessage = Array.isArray(message?.command)
+      ? message.command.filter((entry) => typeof entry === "string" && entry.length > 0)
+      : [];
+
+    let command = commandFromMessage;
+    let shell = null;
+
+    if (command.length === 0) {
+      shell = this._resolveShellPath(message?.shell);
+      command = this._defaultShellCommand(shell);
+    } else {
+      shell = command[0];
+    }
+
+    return {
+      command,
+      shell,
+      cwd: cwdResult.cwd,
+      requestedCwd: cwdResult.requestedCwd,
+      cwdWasFallback: cwdResult.cwdWasFallback,
+      env: this._buildEnv(message?.env)
+    };
+  }
+
+  _spawnRuntime(launchConfig, message) {
+    const bunPtyRuntime = this._spawnBunPtyRuntime(launchConfig, message);
+    if (bunPtyRuntime) {
+      return bunPtyRuntime;
+    }
+
+    const pythonPtyRuntime = this._spawnPythonPtyRuntime(launchConfig);
+    if (pythonPtyRuntime) {
+      return pythonPtyRuntime;
+    }
+
+    const [bin, ...args] = launchConfig.command;
+    const proc = childSpawn(bin, args, {
+      cwd: launchConfig.cwd,
+      env: launchConfig.env,
+      stdio: ["pipe", "pipe", "pipe"]
+    });
+
+    return {
+      mode: "pipe",
+      proc
+    };
+  }
+
+  _spawnBunPtyRuntime(launchConfig, message) {
+    if (!this.bunPtyAvailable) {
+      return null;
+    }
+
+    const [bin, ...args] = launchConfig.command;
+    try {
+      const bridgePath = fileURLToPath(new URL("./bun-pty-bridge.mjs", import.meta.url));
+      const config = JSON.stringify({
+        file: bin,
+        args,
+        cwd: launchConfig.cwd,
+        env: launchConfig.env,
+        cols: this._coerceDimension(message?.cols, 120),
+        rows: this._coerceDimension(message?.rows, 30),
+        term: launchConfig.env.TERM || "xterm-256color"
+      });
+
+      const proc = childSpawn("bun", [bridgePath], {
+        cwd: launchConfig.cwd,
+        env: {
+          ...launchConfig.env,
+          CODEX_WEBSTRAP_BUN_PTY_CONFIG: config
+        },
+        stdio: ["pipe", "pipe", "pipe"]
+      });
+
+      return {
+        mode: "bun-pty",
+        proc,
+        bunStdoutBuffer: ""
+      };
+    } catch (error) {
+      this.bunPtyAvailable = false;
+      if (!this.loggedBunPtyFailure) {
+        this.loggedBunPtyFailure = true;
+        this.logger.warn("Bun PTY unavailable; falling back", {
+          error: toErrorMessage(error)
+        });
+      }
+      return null;
+    }
+  }
+
+  _spawnPythonPtyRuntime(launchConfig) {
+    if (!this.pythonPtyAvailable) {
+      return null;
+    }
+
+    const [bin, ...args] = launchConfig.command;
+    try {
+      const proc = childSpawn(
+        "python3",
+        [
+          "-c",
+          "import pty, sys; pty.spawn(sys.argv[1:])",
+          bin,
+          ...args
+        ],
+        {
+          cwd: launchConfig.cwd,
+          env: launchConfig.env,
+          stdio: ["pipe", "pipe", "pipe"]
+        }
+      );
+      return {
+        mode: "python-pty",
+        proc
+      };
+    } catch (error) {
+      this.pythonPtyAvailable = false;
+      if (!this.loggedPythonPtyFailure) {
+        this.loggedPythonPtyFailure = true;
+        this.logger.warn("python3 PTY fallback unavailable; using pipe terminal", {
+          error: toErrorMessage(error)
+        });
+      }
+      return null;
+    }
+  }
+
+  _attachBunPtyProcess(sessionId, session) {
+    const handleBridgeLine = (line) => {
+      const parsed = safeJsonParse(line);
+      if (!parsed || typeof parsed !== "object") {
+        return;
+      }
+
+      if (parsed.type === "data") {
+        this._broadcast(sessionId, {
+          type: "terminal-data",
+          sessionId,
+          data: typeof parsed.data === "string" ? parsed.data : ""
+        });
+        return;
+      }
+
+      if (parsed.type === "error") {
+        this._broadcast(sessionId, {
+          type: "terminal-error",
+          sessionId,
+          message: typeof parsed.message === "string" ? parsed.message : "bun-pty bridge error"
+        });
+        return;
+      }
+
+      if (parsed.type === "exit") {
+        this._broadcast(sessionId, {
+          type: "terminal-exit",
+          sessionId,
+          code: typeof parsed.exitCode === "number" ? parsed.exitCode : null,
+          signal: parsed.signal ?? null
+        });
+        this.sessions.delete(sessionId);
+      }
+    };
+
+    session.proc.stdout?.on("data", (chunk) => {
+      session.bunStdoutBuffer += chunk.toString("utf8");
+      for (;;) {
+        const newlineAt = session.bunStdoutBuffer.indexOf("\n");
+        if (newlineAt < 0) {
+          break;
+        }
+        const line = session.bunStdoutBuffer.slice(0, newlineAt);
+        session.bunStdoutBuffer = session.bunStdoutBuffer.slice(newlineAt + 1);
+        if (line.trim().length === 0) {
+          continue;
+        }
+        handleBridgeLine(line);
+      }
+    });
+
+    session.proc.stderr?.on("data", (chunk) => {
+      this._broadcast(sessionId, {
+        type: "terminal-error",
+        sessionId,
+        message: chunk.toString("utf8")
+      });
+    });
+
+    session.proc.on("error", (error) => {
+      this._broadcast(sessionId, {
+        type: "terminal-error",
+        sessionId,
+        message: toErrorMessage(error)
+      });
+    });
+
+    session.proc.on("exit", (code, signal) => {
+      if (!this.sessions.has(sessionId)) {
+        return;
+      }
+      this._broadcast(sessionId, {
+        type: "terminal-exit",
+        sessionId,
+        code,
+        signal
+      });
+      this.sessions.delete(sessionId);
+    });
+  }
+
+  _writeToBunPty(session, payload) {
+    if (!session?.proc?.stdin || session.proc.stdin.destroyed) {
+      return;
+    }
+    session.proc.stdin.write(`${JSON.stringify(payload)}\n`);
+  }
+
+  _detectBunPtyAvailability() {
+    const hasBun = childSpawnSync("bun", ["--version"], { stdio: "ignore" });
+    if (hasBun.status !== 0 || hasBun.error) {
+      return false;
+    }
+
+    const probe = childSpawnSync(
+      "bun",
+      ["-e", "import 'bun-pty';"],
+      { stdio: "ignore" }
+    );
+    return probe.status === 0 && !probe.error;
+  }
+
+  _detectPythonPtyAvailability() {
+    const probe = childSpawnSync(
+      "python3",
+      ["-c", "import pty"],
+      { stdio: "ignore" }
+    );
+    return probe.status === 0 && !probe.error;
+  }
+
+  _buildEnv(messageEnv) {
+    const env = {
+      ...process.env,
+      ...(messageEnv && typeof messageEnv === "object" ? messageEnv : {})
+    };
+
+    if (!env.TERM || env.TERM === "dumb") {
+      env.TERM = "xterm-256color";
+    }
+    if (!env.COLORTERM) {
+      env.COLORTERM = "truecolor";
+    }
+    if (!env.TERM_PROGRAM) {
+      env.TERM_PROGRAM = "codex-webstrapper";
+    }
+    return env;
+  }
+
+  _resolveShellPath(messageShell) {
+    if (typeof messageShell === "string" && messageShell.trim().length > 0) {
+      return messageShell.trim();
+    }
+    return process.env.SHELL || "/bin/zsh";
+  }
+
+  _defaultShellCommand(shellPath) {
+    const shellName = path.basename(shellPath).toLowerCase();
+    const disableProfileLoad = process.env.CODEX_WEBSTRAP_TERMINAL_NO_PROFILE === "1";
+    const preferLoginProfile = this.hasPtyLikeRuntime && !disableProfileLoad;
+
+    if (shellName === "zsh") {
+      return preferLoginProfile
+        ? [shellPath, "-il"]
+        : [shellPath, "-fi"];
+    }
+    if (shellName === "bash") {
+      return preferLoginProfile
+        ? [shellPath, "-il"]
+        : [shellPath, "--noprofile", "--norc", "-i"];
+    }
+    if (shellName === "fish") {
+      return preferLoginProfile
+        ? [shellPath, "-il"]
+        : [shellPath, "-i"];
+    }
+    return [shellPath, "-i"];
+  }
+
+  _resolveCwd(requestedCwd) {
+    const requested = requestedCwd && requestedCwd.length > 0
+      ? path.resolve(requestedCwd)
+      : null;
+    if (requested && this._isDirectory(requested)) {
+      return {
+        cwd: requested,
+        requestedCwd: requested,
+        cwdWasFallback: false
+      };
+    }
+
+    const fallbackCandidates = [process.cwd(), os.homedir(), "/"];
+    const fallback = fallbackCandidates.find((candidate) => this._isDirectory(candidate)) || process.cwd();
+    return {
+      cwd: fallback,
+      requestedCwd: requested,
+      cwdWasFallback: Boolean(requested)
+    };
+  }
+
+  _isDirectory(candidatePath) {
+    if (!candidatePath || typeof candidatePath !== "string") {
+      return false;
+    }
+    try {
+      return statSync(candidatePath).isDirectory();
+    } catch {
+      return false;
+    }
+  }
+
+  _coerceDimension(value, fallback) {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      return fallback;
+    }
+    return Math.max(1, Math.floor(parsed));
   }
 }
 
@@ -543,7 +986,7 @@ export class MessageRouter {
           this.terminals.write(message.sessionId, message.data || "");
           return;
         case "terminal-resize":
-          this.terminals.resize(message.sessionId);
+          this.terminals.resize(message.sessionId, message.cols, message.rows);
           return;
         case "terminal-close":
           this.terminals.close(message.sessionId);
@@ -2153,7 +2596,7 @@ export class MessageRouter {
 
   async _runCommand(command, args, { timeoutMs = 5_000, allowNonZero = false, cwd = process.cwd() } = {}) {
     return new Promise((resolve) => {
-      const child = spawn(command, args, {
+      const child = childSpawn(command, args, {
         cwd,
         env: process.env,
         stdio: ["ignore", "pipe", "pipe"]
@@ -2741,7 +3184,7 @@ export class MessageRouter {
       return;
     }
 
-    const child = spawn("open", [url], {
+    const child = childSpawn("open", [url], {
       stdio: ["ignore", "ignore", "ignore"],
       detached: true
     });
