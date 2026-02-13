@@ -1,9 +1,10 @@
-import { spawn } from "node:child_process";
+import { spawn as childSpawn, spawnSync as childSpawnSync } from "node:child_process";
 import { Worker } from "node:worker_threads";
 import os from "node:os";
 import path from "node:path";
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import fs from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 
 import { createLogger, randomId, safeJsonParse, toErrorMessage } from "./util.mjs";
 
@@ -76,6 +77,11 @@ class TerminalRegistry {
     this.sendToWs = sendToWs;
     this.logger = logger;
     this.sessions = new Map();
+    this.bunPtyAvailable = this._detectBunPtyAvailability();
+    this.loggedBunPtyFailure = false;
+    this.pythonPtyAvailable = this._detectPythonPtyAvailability();
+    this.loggedPythonPtyFailure = false;
+    this.hasPtyLikeRuntime = this.bunPtyAvailable || this.pythonPtyAvailable;
   }
 
   createOrAttach(ws, message) {
@@ -83,41 +89,80 @@ class TerminalRegistry {
     const existing = this.sessions.get(sessionId);
     if (existing) {
       existing.listeners.add(ws);
-      this.sendToWs(ws, { type: "terminal-attached", sessionId });
+      this.sendToWs(ws, {
+        type: "terminal-attached",
+        sessionId,
+        cwd: existing.cwd,
+        shell: existing.shell
+      });
+      this.sendToWs(ws, {
+        type: "terminal-init-log",
+        sessionId,
+        log: existing.attachLog
+      });
+      if (this._hasExplicitDimensions(message)) {
+        this.resize(sessionId, message.cols, message.rows);
+      }
       return;
     }
 
-    const shell = process.env.SHELL || "/bin/zsh";
-    const command = Array.isArray(message.command) && message.command.length > 0
-      ? message.command
-      : [shell];
+    const launchConfig = this._resolveLaunchConfig(message);
+    let runtime;
+    try {
+      runtime = this._spawnRuntime(launchConfig, message);
+    } catch (error) {
+      this.sendToWs(ws, {
+        type: "terminal-error",
+        sessionId,
+        message: toErrorMessage(error)
+      });
+      this.logger.warn("Terminal spawn failed", {
+        sessionId,
+        error: toErrorMessage(error)
+      });
+      return;
+    }
 
-    const [bin, ...args] = command;
-    const proc = spawn(bin, args, {
-      cwd: message.cwd || process.cwd(),
-      env: {
-        ...process.env,
-        ...(message.env || {})
-      },
-      stdio: ["pipe", "pipe", "pipe"]
-    });
+    const attachLogLines = [
+      `Terminal attached via codex-webstrapper (${runtime.mode})`
+    ];
+    if (launchConfig.cwdWasFallback && launchConfig.requestedCwd) {
+      attachLogLines.push(`[webstrap] Requested cwd unavailable: ${launchConfig.requestedCwd}`);
+      attachLogLines.push(`[webstrap] Using cwd: ${launchConfig.cwd}`);
+    }
+    const attachLog = `${attachLogLines.join("\r\n")}\r\n`;
 
     const session = {
       sessionId,
-      proc,
-      listeners: new Set([ws])
+      listeners: new Set([ws]),
+      cwd: launchConfig.cwd,
+      shell: launchConfig.shell,
+      attachLog,
+      cols: runtime.cols ?? this._coerceDimension(message?.cols, 120),
+      rows: runtime.rows ?? this._coerceDimension(message?.rows, 30),
+      ...runtime
     };
 
     this.sessions.set(sessionId, session);
 
-    this.sendToWs(ws, { type: "terminal-attached", sessionId });
+    this.sendToWs(ws, {
+      type: "terminal-attached",
+      sessionId,
+      cwd: session.cwd,
+      shell: session.shell
+    });
     this.sendToWs(ws, {
       type: "terminal-init-log",
       sessionId,
-      log: "Terminal attached via codex-webstrapper\r\n"
+      log: session.attachLog
     });
 
-    proc.stdout?.on("data", (chunk) => {
+    if (session.mode === "bun-pty") {
+      this._attachBunPtyProcess(sessionId, session);
+      return;
+    }
+
+    session.proc.stdout?.on("data", (chunk) => {
       this._broadcast(sessionId, {
         type: "terminal-data",
         sessionId,
@@ -125,7 +170,7 @@ class TerminalRegistry {
       });
     });
 
-    proc.stderr?.on("data", (chunk) => {
+    session.proc.stderr?.on("data", (chunk) => {
       this._broadcast(sessionId, {
         type: "terminal-data",
         sessionId,
@@ -133,7 +178,7 @@ class TerminalRegistry {
       });
     });
 
-    proc.on("error", (error) => {
+    session.proc.on("error", (error) => {
       this._broadcast(sessionId, {
         type: "terminal-error",
         sessionId,
@@ -141,7 +186,7 @@ class TerminalRegistry {
       });
     });
 
-    proc.on("exit", (code, signal) => {
+    session.proc.on("exit", (code, signal) => {
       this._broadcast(sessionId, {
         type: "terminal-exit",
         sessionId,
@@ -154,22 +199,95 @@ class TerminalRegistry {
 
   write(sessionId, data) {
     const session = this.sessions.get(sessionId);
-    if (!session || !session.proc.stdin || session.proc.stdin.destroyed) {
+    if (!session) {
       return;
     }
-    session.proc.stdin.write(data);
+
+    if (session.mode === "bun-pty") {
+      try {
+        this._writeToBunPty(session, {
+          type: "write",
+          data
+        });
+      } catch (error) {
+        this._broadcast(sessionId, {
+          type: "terminal-error",
+          sessionId,
+          message: toErrorMessage(error)
+        });
+      }
+      return;
+    }
+
+    if (!session.proc.stdin || session.proc.stdin.destroyed) {
+      return;
+    }
+
+    try {
+      session.proc.stdin.write(data);
+    } catch (error) {
+      this._broadcast(sessionId, {
+        type: "terminal-error",
+        sessionId,
+        message: toErrorMessage(error)
+      });
+    }
   }
 
-  resize(sessionId) {
-    if (!this.sessions.has(sessionId)) {
+  resize(sessionId, cols, rows) {
+    const session = this.sessions.get(sessionId);
+    if (!session) {
       return;
     }
-    this.logger.debug("Terminal resize ignored (non-PTY mode)", { sessionId });
+
+    if (session.mode === "bun-pty") {
+      try {
+        const nextCols = this._coerceDimension(cols, session.cols || 120);
+        const nextRows = this._coerceDimension(rows, session.rows || 30);
+        this._writeToBunPty(session, {
+          type: "resize",
+          cols: nextCols,
+          rows: nextRows
+        });
+        session.cols = nextCols;
+        session.rows = nextRows;
+      } catch (error) {
+        this._broadcast(sessionId, {
+          type: "terminal-error",
+          sessionId,
+          message: toErrorMessage(error)
+        });
+      }
+      return;
+    }
+
+    if (session.mode !== "python-pty") {
+      this.logger.debug("Terminal resize ignored (non-PTY mode)", { sessionId });
+      return;
+    }
   }
 
   close(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session) {
+      return;
+    }
+
+    if (session.mode === "bun-pty") {
+      try {
+        this._writeToBunPty(session, {
+          type: "close"
+        });
+      } catch (error) {
+        this.logger.debug("Bun PTY close command failed", {
+          sessionId,
+          error: toErrorMessage(error)
+        });
+      }
+      if (!session.proc.killed) {
+        session.proc.kill();
+      }
+      this.sessions.delete(sessionId);
       return;
     }
 
@@ -203,6 +321,353 @@ class TerminalRegistry {
     for (const listener of session.listeners) {
       this.sendToWs(listener, message);
     }
+  }
+
+  _resolveLaunchConfig(message) {
+    const requestedCwd = typeof message?.cwd === "string" ? message.cwd.trim() : "";
+    const cwdResult = this._resolveCwd(requestedCwd);
+
+    const commandFromMessage = Array.isArray(message?.command)
+      ? message.command.filter((entry) => typeof entry === "string" && entry.length > 0)
+      : [];
+
+    let command = commandFromMessage;
+    let shell = null;
+
+    if (command.length === 0) {
+      shell = this._resolveShellPath(message?.shell);
+      command = this._defaultShellCommand(shell);
+    } else {
+      shell = command[0];
+    }
+
+    return {
+      command,
+      shell,
+      cwd: cwdResult.cwd,
+      requestedCwd: cwdResult.requestedCwd,
+      cwdWasFallback: cwdResult.cwdWasFallback,
+      env: this._buildEnv(message?.env)
+    };
+  }
+
+  _spawnRuntime(launchConfig, message) {
+    const bunPtyRuntime = this._spawnBunPtyRuntime(launchConfig, message);
+    if (bunPtyRuntime) {
+      return bunPtyRuntime;
+    }
+
+    const pythonPtyRuntime = this._spawnPythonPtyRuntime(launchConfig);
+    if (pythonPtyRuntime) {
+      return pythonPtyRuntime;
+    }
+
+    const [bin, ...args] = launchConfig.command;
+    const proc = childSpawn(bin, args, {
+      cwd: launchConfig.cwd,
+      env: launchConfig.env,
+      stdio: ["pipe", "pipe", "pipe"]
+    });
+
+    return {
+      mode: "pipe",
+      proc,
+      cols: this._coerceDimension(message?.cols, 120),
+      rows: this._coerceDimension(message?.rows, 30)
+    };
+  }
+
+  _spawnBunPtyRuntime(launchConfig, message) {
+    if (!this.bunPtyAvailable) {
+      return null;
+    }
+
+    const [bin, ...args] = launchConfig.command;
+    try {
+      const bridgePath = fileURLToPath(new URL("./bun-pty-bridge.mjs", import.meta.url));
+      const initialCols = this._coerceDimension(message?.cols, 120);
+      const initialRows = this._coerceDimension(message?.rows, 30);
+      const config = JSON.stringify({
+        file: bin,
+        args,
+        cwd: launchConfig.cwd,
+        env: launchConfig.env,
+        cols: initialCols,
+        rows: initialRows,
+        term: launchConfig.env.TERM || "xterm-256color"
+      });
+
+      const proc = childSpawn("bun", [bridgePath], {
+        cwd: launchConfig.cwd,
+        env: {
+          ...launchConfig.env,
+          CODEX_WEBSTRAP_BUN_PTY_CONFIG: config
+        },
+        stdio: ["pipe", "pipe", "pipe"]
+      });
+
+      return {
+        mode: "bun-pty",
+        proc,
+        bunStdoutBuffer: "",
+        cols: initialCols,
+        rows: initialRows
+      };
+    } catch (error) {
+      this.bunPtyAvailable = false;
+      if (!this.loggedBunPtyFailure) {
+        this.loggedBunPtyFailure = true;
+        this.logger.warn("Bun PTY unavailable; falling back", {
+          error: toErrorMessage(error)
+        });
+      }
+      return null;
+    }
+  }
+
+  _spawnPythonPtyRuntime(launchConfig) {
+    if (!this.pythonPtyAvailable) {
+      return null;
+    }
+
+    const [bin, ...args] = launchConfig.command;
+    try {
+      const proc = childSpawn(
+        "python3",
+        [
+          "-c",
+          "import pty, sys; pty.spawn(sys.argv[1:])",
+          bin,
+          ...args
+        ],
+        {
+          cwd: launchConfig.cwd,
+          env: launchConfig.env,
+          stdio: ["pipe", "pipe", "pipe"]
+        }
+      );
+      return {
+        mode: "python-pty",
+        proc,
+        cols: 120,
+        rows: 30
+      };
+    } catch (error) {
+      this.pythonPtyAvailable = false;
+      if (!this.loggedPythonPtyFailure) {
+        this.loggedPythonPtyFailure = true;
+        this.logger.warn("python3 PTY fallback unavailable; using pipe terminal", {
+          error: toErrorMessage(error)
+        });
+      }
+      return null;
+    }
+  }
+
+  _attachBunPtyProcess(sessionId, session) {
+    const handleBridgeLine = (line) => {
+      const parsed = safeJsonParse(line);
+      if (!parsed || typeof parsed !== "object") {
+        return;
+      }
+
+      if (parsed.type === "data") {
+        this._broadcast(sessionId, {
+          type: "terminal-data",
+          sessionId,
+          data: typeof parsed.data === "string" ? parsed.data : ""
+        });
+        return;
+      }
+
+      if (parsed.type === "error") {
+        this._broadcast(sessionId, {
+          type: "terminal-error",
+          sessionId,
+          message: typeof parsed.message === "string" ? parsed.message : "bun-pty bridge error"
+        });
+        return;
+      }
+
+      if (parsed.type === "exit") {
+        this._broadcast(sessionId, {
+          type: "terminal-exit",
+          sessionId,
+          code: typeof parsed.exitCode === "number" ? parsed.exitCode : null,
+          signal: parsed.signal ?? null
+        });
+        this.sessions.delete(sessionId);
+      }
+    };
+
+    session.proc.stdout?.on("data", (chunk) => {
+      session.bunStdoutBuffer += chunk.toString("utf8");
+      for (;;) {
+        const newlineAt = session.bunStdoutBuffer.indexOf("\n");
+        if (newlineAt < 0) {
+          break;
+        }
+        const line = session.bunStdoutBuffer.slice(0, newlineAt);
+        session.bunStdoutBuffer = session.bunStdoutBuffer.slice(newlineAt + 1);
+        if (line.trim().length === 0) {
+          continue;
+        }
+        handleBridgeLine(line);
+      }
+    });
+
+    session.proc.stderr?.on("data", (chunk) => {
+      this._broadcast(sessionId, {
+        type: "terminal-error",
+        sessionId,
+        message: chunk.toString("utf8")
+      });
+    });
+
+    session.proc.on("error", (error) => {
+      this._broadcast(sessionId, {
+        type: "terminal-error",
+        sessionId,
+        message: toErrorMessage(error)
+      });
+    });
+
+    session.proc.on("exit", (code, signal) => {
+      if (!this.sessions.has(sessionId)) {
+        return;
+      }
+      this._broadcast(sessionId, {
+        type: "terminal-exit",
+        sessionId,
+        code,
+        signal
+      });
+      this.sessions.delete(sessionId);
+    });
+  }
+
+  _writeToBunPty(session, payload) {
+    if (!session?.proc?.stdin || session.proc.stdin.destroyed) {
+      return;
+    }
+    session.proc.stdin.write(`${JSON.stringify(payload)}\n`);
+  }
+
+  _detectBunPtyAvailability() {
+    const hasBun = childSpawnSync("bun", ["--version"], { stdio: "ignore" });
+    if (hasBun.status !== 0 || hasBun.error) {
+      return false;
+    }
+
+    const probe = childSpawnSync(
+      "bun",
+      ["-e", "import 'bun-pty';"],
+      { stdio: "ignore" }
+    );
+    return probe.status === 0 && !probe.error;
+  }
+
+  _detectPythonPtyAvailability() {
+    const probe = childSpawnSync(
+      "python3",
+      ["-c", "import pty"],
+      { stdio: "ignore" }
+    );
+    return probe.status === 0 && !probe.error;
+  }
+
+  _buildEnv(messageEnv) {
+    const env = {
+      ...process.env,
+      ...(messageEnv && typeof messageEnv === "object" ? messageEnv : {})
+    };
+
+    if (!env.TERM || env.TERM === "dumb") {
+      env.TERM = "xterm-256color";
+    }
+    if (!env.COLORTERM) {
+      env.COLORTERM = "truecolor";
+    }
+    if (!env.TERM_PROGRAM) {
+      env.TERM_PROGRAM = "codex-webstrapper";
+    }
+    return env;
+  }
+
+  _resolveShellPath(messageShell) {
+    if (typeof messageShell === "string" && messageShell.trim().length > 0) {
+      return messageShell.trim();
+    }
+    return process.env.SHELL || "/bin/zsh";
+  }
+
+  _defaultShellCommand(shellPath) {
+    const shellName = path.basename(shellPath).toLowerCase();
+    const disableProfileLoad = process.env.CODEX_WEBSTRAP_TERMINAL_NO_PROFILE === "1";
+    const preferLoginProfile = this.hasPtyLikeRuntime && !disableProfileLoad;
+
+    if (shellName === "zsh") {
+      return preferLoginProfile
+        ? [shellPath, "-il"]
+        : [shellPath, "-fi"];
+    }
+    if (shellName === "bash") {
+      return preferLoginProfile
+        ? [shellPath, "-il"]
+        : [shellPath, "--noprofile", "--norc", "-i"];
+    }
+    if (shellName === "fish") {
+      return preferLoginProfile
+        ? [shellPath, "-il"]
+        : [shellPath, "-i"];
+    }
+    return [shellPath, "-i"];
+  }
+
+  _resolveCwd(requestedCwd) {
+    const requested = requestedCwd && requestedCwd.length > 0
+      ? path.resolve(requestedCwd)
+      : null;
+    if (requested && this._isDirectory(requested)) {
+      return {
+        cwd: requested,
+        requestedCwd: requested,
+        cwdWasFallback: false
+      };
+    }
+
+    const fallbackCandidates = [process.cwd(), os.homedir(), "/"];
+    const fallback = fallbackCandidates.find((candidate) => this._isDirectory(candidate)) || process.cwd();
+    return {
+      cwd: fallback,
+      requestedCwd: requested,
+      cwdWasFallback: Boolean(requested)
+    };
+  }
+
+  _isDirectory(candidatePath) {
+    if (!candidatePath || typeof candidatePath !== "string") {
+      return false;
+    }
+    try {
+      return statSync(candidatePath).isDirectory();
+    } catch {
+      return false;
+    }
+  }
+
+  _coerceDimension(value, fallback) {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      return fallback;
+    }
+    return Math.max(1, Math.floor(parsed));
+  }
+
+  _hasExplicitDimensions(message) {
+    const cols = Number(message?.cols);
+    const rows = Number(message?.rows);
+    return Number.isFinite(cols) && cols > 0 && Number.isFinite(rows) && rows > 0;
   }
 }
 
@@ -543,7 +1008,7 @@ export class MessageRouter {
           this.terminals.write(message.sessionId, message.data || "");
           return;
         case "terminal-resize":
-          this.terminals.resize(message.sessionId);
+          this.terminals.resize(message.sessionId, message.cols, message.rows);
           return;
         case "terminal-close":
           this.terminals.close(message.sessionId);
@@ -753,11 +1218,22 @@ export class MessageRouter {
     this.logger.debug("renderer-fetch", {
       requestId,
       method: message.method || "GET",
-      url: message.url || null,
-      body: typeof message.body === "string" ? message.body.slice(0, 400) : null
+      url: this._sanitizeUrlForLogs(message.url),
+      hasBody: message.body != null
     });
 
     if (await this._handleVirtualFetch(ws, requestId, message)) {
+      return;
+    }
+
+    if (typeof message.url === "string" && message.url === "/transcribe") {
+      const controller = new AbortController();
+      this.fetchControllers.set(requestId, controller);
+      try {
+        await this._handleTranscribeFetch(ws, requestId, message, controller.signal);
+      } finally {
+        this.fetchControllers.delete(requestId);
+      }
       return;
     }
 
@@ -772,7 +1248,7 @@ export class MessageRouter {
       });
       this.logger.warn("renderer-fetch-failed", {
         requestId,
-        url: message.url || null,
+        url: this._sanitizeUrlForLogs(message.url),
         error: "unsupported_fetch_url"
       });
       return;
@@ -782,10 +1258,11 @@ export class MessageRouter {
     this.fetchControllers.set(requestId, controller);
 
     try {
+      const outbound = this._prepareOutgoingFetchRequest(message);
       const response = await fetch(resolvedUrl, {
-        method: message.method || "GET",
-        headers: message.headers || {},
-        body: message.body,
+        method: outbound.method,
+        headers: outbound.headers,
+        body: outbound.body,
         signal: controller.signal
       });
 
@@ -814,7 +1291,7 @@ export class MessageRouter {
         requestId,
         status: response.status,
         ok: response.ok,
-        url: response.url || resolvedUrl
+        url: this._sanitizeUrlForLogs(response.url || resolvedUrl)
       });
     } catch (error) {
       this.sendMainMessage(ws, {
@@ -826,12 +1303,277 @@ export class MessageRouter {
       });
       this.logger.warn("renderer-fetch-failed", {
         requestId,
-        url: resolvedUrl,
+        url: this._sanitizeUrlForLogs(resolvedUrl),
         error: toErrorMessage(error)
       });
     } finally {
       this.fetchControllers.delete(requestId);
     }
+  }
+
+  async _handleTranscribeFetch(ws, requestId, message, signal) {
+    try {
+      const outbound = this._prepareOutgoingFetchRequest(message);
+      const bodyBuffer = this._asBuffer(outbound.body);
+      const contentType = this._readHeader(outbound.headers, "content-type");
+      const boundary = this._extractMultipartBoundary(contentType);
+      if (!boundary) {
+        throw new Error("Missing multipart boundary for /transcribe request.");
+      }
+
+      const { fields, files } = this._parseMultipartBody(bodyBuffer, boundary);
+      const file = files.find((part) => part.name === "file") || files[0];
+      if (!file || !file.data || file.data.length === 0) {
+        throw new Error("Missing audio file in /transcribe request.");
+      }
+
+      const authToken = await this._resolveTranscriptionAuthToken();
+      if (!authToken) {
+        throw new Error("Dictation requires ChatGPT authentication in Codex.");
+      }
+
+      const model = process.env.CODEX_WEBSTRAP_TRANSCRIBE_MODEL || "gpt-4o-mini-transcribe";
+      const form = new FormData();
+      form.append("model", model);
+      if (typeof fields.language === "string" && fields.language.trim().length > 0) {
+        form.append("language", fields.language.trim());
+      }
+      form.append(
+        "file",
+        new Blob([file.data], { type: file.contentType || "audio/webm" }),
+        file.filename || "codex.webm"
+      );
+
+      const response = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${authToken}`
+        },
+        body: form,
+        signal
+      });
+      const responseText = await response.text();
+
+      let bodyJsonString = responseText;
+      if (response.ok) {
+        const parsed = safeJsonParse(responseText);
+        if (parsed && typeof parsed === "object" && typeof parsed.text === "string") {
+          bodyJsonString = JSON.stringify({ text: parsed.text });
+        } else {
+          bodyJsonString = JSON.stringify({ text: "" });
+        }
+      }
+
+      this.sendMainMessage(ws, {
+        type: "fetch-response",
+        requestId,
+        responseType: "success",
+        status: response.status,
+        headers: {
+          "content-type": response.headers.get("content-type") || "application/json"
+        },
+        bodyJsonString
+      });
+    } catch (error) {
+      this.sendMainMessage(ws, {
+        type: "fetch-response",
+        requestId,
+        responseType: "error",
+        status: 0,
+        error: toErrorMessage(error)
+      });
+      this.logger.warn("transcribe-fetch-failed", {
+        requestId,
+        error: toErrorMessage(error)
+      });
+    }
+  }
+
+  _prepareOutgoingFetchRequest(message) {
+    const method = message?.method || "GET";
+    const headers = message?.headers && typeof message.headers === "object"
+      ? { ...message.headers }
+      : {};
+    let body = message?.body;
+
+    const base64Marker = this._readHeader(headers, "x-codex-base64");
+    if (base64Marker === "1") {
+      this._deleteHeader(headers, "x-codex-base64");
+      if (typeof body !== "string") {
+        throw new Error("X-Codex-Base64 fetch body must be a base64 string.");
+      }
+      body = Buffer.from(body, "base64");
+    }
+
+    return {
+      method,
+      headers,
+      body
+    };
+  }
+
+  _asBuffer(body) {
+    if (Buffer.isBuffer(body)) {
+      return body;
+    }
+    if (body instanceof Uint8Array) {
+      return Buffer.from(body);
+    }
+    if (typeof body === "string") {
+      return Buffer.from(body, "utf8");
+    }
+    if (body == null) {
+      return Buffer.alloc(0);
+    }
+    return Buffer.from(String(body), "utf8");
+  }
+
+  _extractMultipartBoundary(contentType) {
+    if (typeof contentType !== "string") {
+      return null;
+    }
+    const match = contentType.match(/boundary=([^;]+)/i);
+    if (!match || !match[1]) {
+      return null;
+    }
+    return match[1].trim().replace(/^"|"$/g, "");
+  }
+
+  _parseMultipartBody(body, boundary) {
+    const files = [];
+    const fields = {};
+    const delimiter = Buffer.from(`--${boundary}`);
+    const partSeparator = Buffer.from("\r\n\r\n");
+
+    let cursor = 0;
+    for (;;) {
+      const start = body.indexOf(delimiter, cursor);
+      if (start < 0) {
+        break;
+      }
+
+      cursor = start + delimiter.length;
+      if (body[cursor] === 45 && body[cursor + 1] === 45) {
+        break;
+      }
+      if (body[cursor] === 13 && body[cursor + 1] === 10) {
+        cursor += 2;
+      }
+
+      const headerEnd = body.indexOf(partSeparator, cursor);
+      if (headerEnd < 0) {
+        break;
+      }
+
+      const headersText = body.slice(cursor, headerEnd).toString("utf8");
+      const contentStart = headerEnd + partSeparator.length;
+      const nextBoundary = body.indexOf(Buffer.from(`\r\n--${boundary}`), contentStart);
+      const contentEnd = nextBoundary >= 0 ? nextBoundary : body.length;
+      const content = body.slice(contentStart, contentEnd);
+
+      const headers = {};
+      for (const line of headersText.split("\r\n")) {
+        const splitAt = line.indexOf(":");
+        if (splitAt <= 0) {
+          continue;
+        }
+        const key = line.slice(0, splitAt).trim().toLowerCase();
+        const value = line.slice(splitAt + 1).trim();
+        headers[key] = value;
+      }
+
+      const disposition = headers["content-disposition"] || "";
+      const nameMatch = disposition.match(/\bname="([^"]+)"/i);
+      const filenameMatch = disposition.match(/\bfilename="([^"]+)"/i);
+      const name = nameMatch ? nameMatch[1] : null;
+      const filename = filenameMatch ? filenameMatch[1] : null;
+      const part = {
+        name,
+        filename,
+        contentType: headers["content-type"] || null,
+        data: content
+      };
+
+      if (filename) {
+        files.push(part);
+      } else if (name) {
+        fields[name] = content.toString("utf8");
+      }
+
+      cursor = contentEnd + 2;
+    }
+
+    return { fields, files };
+  }
+
+  async _resolveTranscriptionAuthToken() {
+    if (!this.appServer) {
+      return null;
+    }
+    try {
+      const response = await this.appServer.sendRequest("getAuthStatus", {
+        includeToken: true,
+        refreshToken: true
+      }, {
+        timeoutMs: 10_000
+      });
+      const token = response?.result?.authToken;
+      return typeof token === "string" && token.trim().length > 0 ? token.trim() : null;
+    } catch (error) {
+      this.logger.warn("Failed to resolve transcription auth token", {
+        error: toErrorMessage(error)
+      });
+      return null;
+    }
+  }
+
+  _readHeader(headers, name) {
+    if (!headers || typeof headers !== "object") {
+      return null;
+    }
+
+    const target = String(name).toLowerCase();
+    for (const [key, value] of Object.entries(headers)) {
+      if (String(key).toLowerCase() !== target) {
+        continue;
+      }
+      if (Array.isArray(value)) {
+        return value.length > 0 ? String(value[0]) : "";
+      }
+      return value == null ? null : String(value);
+    }
+    return null;
+  }
+
+  _deleteHeader(headers, name) {
+    if (!headers || typeof headers !== "object") {
+      return;
+    }
+
+    const target = String(name).toLowerCase();
+    for (const key of Object.keys(headers)) {
+      if (String(key).toLowerCase() === target) {
+        delete headers[key];
+      }
+    }
+  }
+
+  _sanitizeUrlForLogs(url) {
+    if (typeof url !== "string" || url.length === 0) {
+      return null;
+    }
+
+    // Drop query params and fragments from logs to avoid leaking tokens/user data.
+    const withoutQuery = url.split("?")[0]?.split("#")[0] ?? "";
+    if (withoutQuery.startsWith("http://") || withoutQuery.startsWith("https://")) {
+      try {
+        const parsed = new URL(withoutQuery);
+        return `${parsed.origin}${parsed.pathname}`;
+      } catch {
+        return withoutQuery;
+      }
+    }
+    return withoutQuery;
   }
 
   _resolveFetchUrl(url) {
@@ -1883,7 +2625,7 @@ export class MessageRouter {
 
   async _runCommand(command, args, { timeoutMs = 5_000, allowNonZero = false, cwd = process.cwd() } = {}) {
     return new Promise((resolve) => {
-      const child = spawn(command, args, {
+      const child = childSpawn(command, args, {
         cwd,
         env: process.env,
         stdio: ["ignore", "pipe", "pipe"]
@@ -1958,7 +2700,7 @@ export class MessageRouter {
       requestId,
       status,
       ok: status >= 200 && status < 300,
-      url
+      url: this._sanitizeUrlForLogs(url)
     });
   }
 
@@ -2471,7 +3213,7 @@ export class MessageRouter {
       return;
     }
 
-    const child = spawn("open", [url], {
+    const child = childSpawn("open", [url], {
       stdio: ["ignore", "ignore", "ignore"],
       detached: true
     });
