@@ -1,6 +1,6 @@
 {
   "name": "codex-webstrapper",
-  "version": "0.2.0",
+  "version": "0.2.5",
   "type": "module",
   "description": "Web wrapper for Codex desktop assets with bridge + token auth",
   "license": "MIT",
