@@ -1,0 +1,21 @@
+# Claude Code
+.claude/
+
+# GitHub
+.github/
+
+# Environment files
+.env*
+
+# Logs
+*.log
+firebase-debug.log*
+
+# Test output
+coverage/
+test/
+tests/
+
+# Temp
+tmp/
+temp/

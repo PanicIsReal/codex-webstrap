@@ -4,6 +4,15 @@
   "type": "module",
   "description": "Web wrapper for Codex desktop assets with bridge + token auth",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/PanicIsReal/codex-webstrap.git"
+  },
+  "homepage": "https://github.com/PanicIsReal/codex-webstrap#readme",
+  "bugs": {
+    "url": "https://github.com/PanicIsReal/codex-webstrap/issues"
+  },
+  "keywords": ["codex", "electron", "web-bridge", "websocket"],
   "bin": {
     "codex-webstrap": "./bin/codex-webstrap.sh",
     "codex-webstrapper": "./bin/codex-webstrap.sh"
