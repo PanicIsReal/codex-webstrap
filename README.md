@@ -74,18 +74,32 @@ This project provides near-parity by emulation/bridging, not by removing those d
 ### CLI
 
 ```bash
-codex-webstrap [--port <n>] [--bind <ip>] [--open] [--token-file <path>] [--codex-app <path>]
-codex-webstrapper [--port <n>] [--bind <ip>] [--open] [--token-file <path>] [--codex-app <path>]
-codex-webstrapper open [--port <n>] [--bind <ip>] [--token-file <path>] [--copy]
+codex-webstrapper [--bind <ip>] [--port <n>] [--config-file <path>] [--auth-mode <off|basic|token>] [--auth-password <value>] [--auth-password-file <path>] [--profile-switching] [--profile-strategy <fixed|round-robin|random>] [--profile-fixed <id-or-label>] [--launch-codex <never|auto>]
+codex-webstrapper open [--bind <ip>] [--port <n>] [--token-file <path>] [--config-file <path>] [--copy]
 ```
 
 ### Environment Overrides
 
-- `CODEX_WEBSTRAP_PORT`
-- `CODEX_WEBSTRAP_BIND`
-- `CODEX_WEBSTRAP_TOKEN_FILE`
-- `CODEX_WEBSTRAP_CODEX_APP`
-- `CODEX_WEBSTRAP_INTERNAL_WS_PORT`
+- `CODEX_RELAY_CONFIG_FILE`
+- `CODEX_RELAY_BIND`
+- `CODEX_RELAY_PORT`
+- `CODEX_RELAY_TOKEN_FILE`
+- `CODEX_RELAY_CODEX_APP`
+- `CODEX_RELAY_INTERNAL_WS_PORT`
+- `CODEX_RELAY_AUTH_MODE`
+- `CODEX_RELAY_AUTH_USERNAME`
+- `CODEX_RELAY_AUTH_PASSWORD`
+- `CODEX_RELAY_AUTH_PASSWORD_FILE`
+- `CODEX_RELAY_LAUNCH_CODEX`
+- `CODEX_RELAY_PROFILE_SWITCHING`
+- `CODEX_RELAY_PROFILE_STRATEGY`
+- `CODEX_RELAY_PROFILE_FIXED`
+- `CODEX_RELAY_PROFILES_DIR`
+- `CODEX_RELAY_HOST_AUTH_FILE`
+- `CODEX_RELAY_PROFILE_STATE_FILE`
+- `CODEX_RELAY_GLOBAL_STATE_FILE`
+
+Legacy `CODEX_WEBSTRAP_*` env vars are still accepted for bind/port/token/app path.
 
 ### HTTP Endpoints
 
@@ -93,6 +107,9 @@ codex-webstrapper open [--port <n>] [--bind <ip>] [--token-file <path>] [--copy]
 - `GET /__webstrapper/shim.js`
 - `GET /__webstrapper/healthz`
 - `GET /__webstrapper/auth?token=...`
+- `GET|POST /__webstrapper/login` (basic auth mode)
+- `GET /__webstrapper/profiles`
+- `POST /__webstrapper/profiles/switch`
 
 ### WebSocket Endpoint
 
@@ -147,6 +164,13 @@ From local checkout:
 ./bin/codex-webstrap.sh --port 8080 --bind 127.0.0.1
 ```
 
+Config file defaults:
+
+- Path: `~/.codex-relay/config.json`
+- Precedence: defaults < config file < env vars < CLI flags
+
+Auth mode defaults to `off`, and bind defaults to `127.0.0.1`.
+
 Optional auto-open:
 
 ```bash
@@ -167,21 +191,43 @@ codex-webstrapper open --copy
 
 ## Authentication Model
 
-1. On first run, a random token is persisted at `~/.codex-webstrap/token` (default path).
-2. You authenticate once via:
+Modes:
+
+1. `off` (default)
+   - No login required.
+2. `basic`
+   - Password login at `/__webstrapper/login`.
+   - Requires `--auth-password` or `--auth-password-file`.
+3. `token`
+   - Token bootstrap at `/__webstrapper/auth?token=...`.
+
+Token details:
+
+1. On first run, a random token is persisted at `~/.codex-relay/token` (default path).
+2. In token mode, authenticate once via:
 
 ```bash
-open "http://127.0.0.1:8080/__webstrapper/auth?token=$(cat ~/.codex-webstrap/token)"
+open "http://127.0.0.1:8080/__webstrapper/auth?token=$(cat ~/.codex-relay/token)"
 ```
 
-Or use the helper command:
+Or use:
 
 ```bash
 codex-webstrapper open
 ```
 
-3. Server sets `cw_session` cookie (`HttpOnly`, `SameSite=Lax`, scoped to `/`).
-4. UI and bridge endpoints require a valid session cookie.
+4. Server sets `cw_session` cookie (`HttpOnly`, `SameSite=Lax`, scoped to `/`).
+5. UI and bridge endpoints require a valid session unless mode is `off`.
+
+## Multi Auth Switching
+
+- Optional profile switching can reuse profiles from `~/.codex/profiles/*.json` (Codex Profiles-compatible layout).
+- Strategies:
+  - `fixed`: always use selected `--profile-fixed` (id or label).
+  - `round-robin`: rotate profiles per switch.
+  - `random`: pick a random profile.
+- Safety lock:
+  - Switching is blocked when native `Codex` desktop process is running, to avoid concurrent writes to `~/.codex/auth.json`.
 
 ## Security Risks and Recommendations
 
@@ -202,7 +248,7 @@ This project can expose powerful local capabilities if misconfigured. Treat it a
 - Rotate token file if exposure is suspected:
 
 ```bash
-rm -f ~/.codex-webstrap/token
+rm -f ~/.codex-relay/token
 ```
 
 Then restart wrapper to generate a new token.
@@ -229,6 +275,14 @@ Unknown message types produce structured `bridge-error` responses and do not cra
 npm test
 ```
 
+### Reverse New DMG Builds
+
+```bash
+./scripts/reverse-codex-dmg.sh --work-dir /tmp/codex-dmg-re
+```
+
+The script caches remote identity in `state.json` and skips re-extract when the DMG version is unchanged. If remote headers are missing, it falls back to DMG SHA-256 identity.
+
 ### Worktree Bootstrap
 
 Bootstrap env/secrets from another worktree checkout:
@@ -251,11 +305,14 @@ Codex setup-script compatible command:
 ### Typical Troubleshooting
 
 - `401 unauthorized`
-  - Authenticate first via `/__webstrapper/auth?token=...`.
+  - In `token` mode, authenticate via `/__webstrapper/auth?token=...`.
+  - In `basic` mode, open `/__webstrapper/login`.
 - UI loads but actions fail
   - Check `GET /__webstrapper/healthz` for app-server/UDS readiness.
 - Codex app not found
   - Pass `--codex-app /path/to/Codex.app`.
+- Profile switch returns `blocked`
+  - Native Codex desktop is running; close it before switching profiles.
 - `codex` CLI spawn failures
   - Ensure the bundled CLI exists in your Codex app install, or set `CODEX_CLI_PATH`.
 

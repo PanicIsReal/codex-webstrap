@@ -11,49 +11,25 @@ done
 SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE_PATH")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-PORT="${CODEX_WEBSTRAP_PORT:-8080}"
-BIND="${CODEX_WEBSTRAP_BIND:-127.0.0.1}"
-OPEN_FLAG="0"
-TOKEN_FILE="${CODEX_WEBSTRAP_TOKEN_FILE:-}"
-CODEX_APP="${CODEX_WEBSTRAP_CODEX_APP:-}"
-INTERNAL_WS_PORT="${CODEX_WEBSTRAP_INTERNAL_WS_PORT:-38080}"
-PORT_SET="0"
-BIND_SET="0"
-COPY_FLAG="0"
-COMMAND="serve"
-
-# Treat non-empty env overrides as explicit selections so open-mode runtime
-# autodetection cannot replace them.
-if [[ -n "${CODEX_WEBSTRAP_PORT:-}" ]]; then
-  PORT_SET="1"
-fi
-if [[ -n "${CODEX_WEBSTRAP_BIND:-}" ]]; then
-  BIND_SET="1"
-fi
-
-DEFAULT_TOKEN_FILE="${HOME}/.codex-webstrap/token"
-if [[ -z "$TOKEN_FILE" ]]; then
-  TOKEN_FILE="$DEFAULT_TOKEN_FILE"
-fi
+DEFAULT_CONFIG_FILE="${HOME}/.codex-relay/config.json"
+DEFAULT_TOKEN_FILE="${HOME}/.codex-relay/token"
 
 print_usage() {
   cat <<USAGE
 Usage:
-  $(basename "$0") [--port <n>] [--bind <ip>] [--open] [--token-file <path>] [--codex-app <path>]
-  $(basename "$0") open [--port <n>] [--bind <ip>] [--token-file <path>] [--copy]
+  $(basename "$0") [server options...]
+  $(basename "$0") open [--port <n>] [--bind <ip>] [--token-file <path>] [--config-file <path>] [--copy]
 
 Commands:
-  open              Build the full auth URL and open it in the browser.
+  open              Build a login URL from current auth mode and open it in the browser.
 
-Options for open:
-  --copy            Copy full auth URL to clipboard with pbcopy instead of launching browser.
+Examples:
+  $(basename "$0") --bind 127.0.0.1 --port 8080 --auth-mode off
+  $(basename "$0") --auth-mode basic --auth-password-file ~/.codex-relay/password.txt
+  $(basename "$0") open --copy
 
-Env overrides:
-  CODEX_WEBSTRAP_PORT
-  CODEX_WEBSTRAP_BIND
-  CODEX_WEBSTRAP_TOKEN_FILE
-  CODEX_WEBSTRAP_CODEX_APP
-  CODEX_WEBSTRAP_INTERNAL_WS_PORT
+Config + env precedence is handled by src/server.mjs:
+  defaults < ~/.codex-relay/config.json < env < CLI flags
 USAGE
 }
 
@@ -66,6 +42,7 @@ require_value() {
   fi
 }
 
+COMMAND="serve"
 if [[ $# -gt 0 ]]; then
   case "$1" in
     open)
@@ -79,12 +56,21 @@ if [[ $# -gt 0 ]]; then
   esac
 fi
 
+if [[ "$COMMAND" == "serve" ]]; then
+  exec node "${ROOT_DIR}/src/server.mjs" "$@"
+fi
+
+PORT="${CODEX_RELAY_PORT:-${CODEX_WEBSTRAP_PORT:-8080}}"
+BIND="${CODEX_RELAY_BIND:-${CODEX_WEBSTRAP_BIND:-127.0.0.1}}"
+TOKEN_FILE="${CODEX_RELAY_TOKEN_FILE:-${CODEX_WEBSTRAP_TOKEN_FILE:-}}"
+CONFIG_FILE="${CODEX_RELAY_CONFIG_FILE:-${CODEX_RELAY_CONFIG:-$DEFAULT_CONFIG_FILE}}"
+AUTH_MODE=""
+COPY_FLAG="0"
+PORT_SET="0"
+BIND_SET="0"
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    open)
-      COMMAND="open"
-      shift
-      ;;
     --port)
       require_value "$1" "${2:-}"
       PORT="$2"
@@ -102,100 +88,116 @@ while [[ $# -gt 0 ]]; do
       TOKEN_FILE="$2"
       shift 2
       ;;
+    --config|--config-file)
+      require_value "$1" "${2:-}"
+      CONFIG_FILE="$2"
+      shift 2
+      ;;
+    --auth-mode)
+      require_value "$1" "${2:-}"
+      AUTH_MODE="$2"
+      shift 2
+      ;;
     --copy)
       COPY_FLAG="1"
       shift
-      ;;
-    --open)
-      OPEN_FLAG="1"
-      shift
-      ;;
-    --codex-app)
-      require_value "$1" "${2:-}"
-      CODEX_APP="$2"
-      shift 2
       ;;
     --help|-h|help)
       print_usage
       exit 0
       ;;
     *)
-      echo "Unknown argument: $1" >&2
+      echo "Unknown argument for open: $1" >&2
       exit 1
       ;;
   esac
 done
 
-if [[ "$COMMAND" != "open" && "$COPY_FLAG" == "1" ]]; then
-  echo "--copy can only be used with the 'open' command" >&2
-  exit 1
-fi
-
-if [[ "$COMMAND" == "open" ]]; then
-  if [[ ! -f "$TOKEN_FILE" ]]; then
-    echo "Token file not found: $TOKEN_FILE" >&2
-    exit 1
-  fi
-
-  TOKEN="$(tr -d '\r\n' < "$TOKEN_FILE")"
-  if [[ -z "$TOKEN" ]]; then
-    echo "Token file is empty: $TOKEN_FILE" >&2
-    exit 1
-  fi
-
-  if [[ "$PORT_SET" == "0" || "$BIND_SET" == "0" ]]; then
-    RUNTIME_FILE="${TOKEN_FILE}.runtime"
-    if [[ -f "$RUNTIME_FILE" ]]; then
-      RUNTIME_VALUES="$(node -e 'const fs = require("node:fs"); const filePath = process.argv[2]; try { const data = JSON.parse(fs.readFileSync(filePath, "utf8")); const bind = data.bind || ""; const port = data.port || ""; if (!bind || !port) { process.exit(1); } process.stdout.write(`${bind}\n${port}\n`); } catch { process.exit(1); }' "$TOKEN_FILE" "$RUNTIME_FILE" 2>/dev/null || true)"
-      if [[ -n "$RUNTIME_VALUES" ]]; then
-        RUNTIME_BIND="$(printf '%s' "$RUNTIME_VALUES" | sed -n '1p')"
-        RUNTIME_PORT="$(printf '%s' "$RUNTIME_VALUES" | sed -n '2p')"
-        if [[ -n "$RUNTIME_BIND" && -n "$RUNTIME_PORT" ]]; then
-          if command -v curl >/dev/null 2>&1; then
-            if curl -fsS --max-time 1 --connect-timeout 1 "http://${RUNTIME_BIND}:${RUNTIME_PORT}/__webstrapper/healthz" >/dev/null 2>&1; then
-              if [[ "$BIND_SET" == "0" ]]; then
-                BIND="$RUNTIME_BIND"
-              fi
-              if [[ "$PORT_SET" == "0" ]]; then
-                PORT="$RUNTIME_PORT"
-              fi
-            fi
-          else
-            if [[ "$BIND_SET" == "0" ]]; then
-              BIND="$RUNTIME_BIND"
-            fi
-            if [[ "$PORT_SET" == "0" ]]; then
-              PORT="$RUNTIME_PORT"
-            fi
-          fi
-        fi
-      fi
+if [[ -f "$CONFIG_FILE" ]]; then
+  CONFIG_VALUES="$(node -e 'const fs=require("node:fs"); const p=process.argv[1]; try { const data=JSON.parse(fs.readFileSync(p,"utf8")); const server=data.server && typeof data.server==="object" ? data.server : {}; const auth=data.auth && typeof data.auth==="object" ? data.auth : {}; const bind=(data.bind ?? server.bind ?? "").toString(); const port=(data.port ?? server.port ?? "").toString(); const token=(data.tokenFile ?? server.tokenFile ?? auth.tokenFile ?? "").toString(); const mode=(data.authMode ?? auth.mode ?? "").toString(); process.stdout.write(`${bind}\n${port}\n${token}\n${mode}\n`); } catch { process.exit(1); }' "$CONFIG_FILE" 2>/dev/null || true)"
+  if [[ -n "$CONFIG_VALUES" ]]; then
+    CFG_BIND="$(printf '%s' "$CONFIG_VALUES" | sed -n '1p')"
+    CFG_PORT="$(printf '%s' "$CONFIG_VALUES" | sed -n '2p')"
+    CFG_TOKEN_FILE="$(printf '%s' "$CONFIG_VALUES" | sed -n '3p')"
+    CFG_AUTH_MODE="$(printf '%s' "$CONFIG_VALUES" | sed -n '4p')"
+    if [[ "$BIND_SET" == "0" && -n "$CFG_BIND" ]]; then
+      BIND="$CFG_BIND"
+    fi
+    if [[ "$PORT_SET" == "0" && -n "$CFG_PORT" ]]; then
+      PORT="$CFG_PORT"
+    fi
+    if [[ -z "$TOKEN_FILE" && -n "$CFG_TOKEN_FILE" ]]; then
+      TOKEN_FILE="$CFG_TOKEN_FILE"
+    fi
+    if [[ -z "$AUTH_MODE" && -n "$CFG_AUTH_MODE" ]]; then
+      AUTH_MODE="$CFG_AUTH_MODE"
     fi
   fi
+fi
 
-  ENCODED_TOKEN="$(node -e 'process.stdout.write(encodeURIComponent(process.argv[1] || ""))' "$TOKEN")"
-  AUTH_URL="http://${BIND}:${PORT}/__webstrapper/auth?token=${ENCODED_TOKEN}"
+if [[ -z "$TOKEN_FILE" ]]; then
+  TOKEN_FILE="$DEFAULT_TOKEN_FILE"
+fi
 
-  if [[ "$COPY_FLAG" == "1" ]]; then
-    if ! command -v pbcopy >/dev/null 2>&1; then
-      echo "pbcopy not found in PATH" >&2
+RUNTIME_FILE="${TOKEN_FILE}.runtime"
+if [[ -f "$RUNTIME_FILE" ]]; then
+  RUNTIME_VALUES="$(node -e 'const fs=require("node:fs"); const p=process.argv[1]; try { const data=JSON.parse(fs.readFileSync(p,"utf8")); process.stdout.write(`${(data.bind||"")}\n${(data.port||"")}\n${(data.authMode||"")}\n`); } catch { process.exit(1); }' "$RUNTIME_FILE" 2>/dev/null || true)"
+  if [[ -n "$RUNTIME_VALUES" ]]; then
+    RUNTIME_BIND="$(printf '%s' "$RUNTIME_VALUES" | sed -n '1p')"
+    RUNTIME_PORT="$(printf '%s' "$RUNTIME_VALUES" | sed -n '2p')"
+    RUNTIME_AUTH_MODE="$(printf '%s' "$RUNTIME_VALUES" | sed -n '3p')"
+    if [[ "$BIND_SET" == "0" && -n "$RUNTIME_BIND" ]]; then
+      BIND="$RUNTIME_BIND"
+    fi
+    if [[ "$PORT_SET" == "0" && -n "$RUNTIME_PORT" ]]; then
+      PORT="$RUNTIME_PORT"
+    fi
+    if [[ -z "$AUTH_MODE" && -n "$RUNTIME_AUTH_MODE" ]]; then
+      AUTH_MODE="$RUNTIME_AUTH_MODE"
+    fi
+  fi
+fi
+
+if [[ -z "$AUTH_MODE" ]]; then
+  AUTH_MODE="off"
+fi
+AUTH_MODE="$(printf '%s' "$AUTH_MODE" | tr '[:upper:]' '[:lower:]')"
+
+TARGET_URL="http://${BIND}:${PORT}/"
+case "$AUTH_MODE" in
+  basic)
+    TARGET_URL="http://${BIND}:${PORT}/__webstrapper/login"
+    ;;
+  token)
+    if [[ ! -f "$TOKEN_FILE" ]]; then
+      echo "Token file not found: $TOKEN_FILE" >&2
       exit 1
     fi
-    printf '%s' "$AUTH_URL" | pbcopy >/dev/null 2>&1
-    printf 'Copied auth URL to clipboard.\n'
-  else
-    open "$AUTH_URL"
-    printf 'Opened auth URL in browser.\n'
-    printf '%s\n' "$AUTH_URL"
+    TOKEN="$(tr -d '\r\n' < "$TOKEN_FILE")"
+    if [[ -z "$TOKEN" ]]; then
+      echo "Token file is empty: $TOKEN_FILE" >&2
+      exit 1
+    fi
+    ENCODED_TOKEN="$(node -e 'process.stdout.write(encodeURIComponent(process.argv[1] || ""))' "$TOKEN")"
+    TARGET_URL="http://${BIND}:${PORT}/__webstrapper/auth?token=${ENCODED_TOKEN}"
+    ;;
+  off)
+    TARGET_URL="http://${BIND}:${PORT}/"
+    ;;
+  *)
+    TARGET_URL="http://${BIND}:${PORT}/"
+    ;;
+esac
+
+if [[ "$COPY_FLAG" == "1" ]]; then
+  if ! command -v pbcopy >/dev/null 2>&1; then
+    echo "pbcopy not found in PATH" >&2
+    exit 1
   fi
-  exit 0
+  printf '%s' "$TARGET_URL" | pbcopy >/dev/null 2>&1
+  printf 'Copied URL to clipboard.\n'
+else
+  open "$TARGET_URL"
+  printf 'Opened URL in browser.\n'
+  printf '%s\n' "$TARGET_URL"
 fi
-
-export CODEX_WEBSTRAP_PORT="$PORT"
-export CODEX_WEBSTRAP_BIND="$BIND"
-export CODEX_WEBSTRAP_TOKEN_FILE="$TOKEN_FILE"
-export CODEX_WEBSTRAP_CODEX_APP="$CODEX_APP"
-export CODEX_WEBSTRAP_INTERNAL_WS_PORT="$INTERNAL_WS_PORT"
-export CODEX_WEBSTRAP_OPEN="$OPEN_FLAG"
-
-exec node "${ROOT_DIR}/src/server.mjs"
