@@ -1,0 +1,3 @@
+# Checksums for releases
+# Each release will have a file: v<version>.txt
+# Example: v0.1.0.txt contains SHA256 checksums for all v0.1.0 binaries
