@@ -453,20 +453,6 @@
           width: 100vw !important;
         }
 
-        /* Header toolbar — swipeable so all buttons remain accessible.
-           When the sidebar is collapsed the portal area expands and can
-           push right-side buttons off-screen; scrolling keeps them
-           reachable via horizontal swipe. */
-        .h-toolbar {
-          overflow-x: auto !important;
-          overflow-y: hidden !important;
-          -webkit-overflow-scrolling: touch !important;
-          scrollbar-width: none !important;
-        }
-        .h-toolbar::-webkit-scrollbar {
-          display: none !important;
-        }
-
         /* Prevent header-left from consuming more than half the bar.
            The app sets an inline min-width via CSS vars that over-allocates
            space for the portal area — override it so buttons fit. */
@@ -477,17 +463,13 @@
           flex-shrink: 0 !important;
           padding-left: 4px !important;
           padding-right: 0 !important;
+          overflow: hidden !important;
         }
 
         /* Collapse the empty portal gap when sidebar is hidden */
         .app-header-left-portal {
           gap: 0 !important;
           padding-right: 2px !important;
-        }
-
-        /* Keep right-side buttons from shrinking below usable size */
-        .h-toolbar button {
-          flex-shrink: 0 !important;
         }
 
         /* Use stable viewport height */
