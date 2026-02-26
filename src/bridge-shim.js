@@ -354,18 +354,19 @@
         }
 
         /* Prevent iOS auto-zoom on focus (triggers when font-size < 16px) */
-        input, textarea, select, [contenteditable="true"] {
+        input, textarea, select {
           font-size: 16px !important;
           max-width: 100% !important;
           box-sizing: border-box !important;
         }
 
-        /* Disable double-tap zoom */
-        * {
-          touch-action: manipulation;
+        [contenteditable="true"] {
+          max-width: 100% !important;
+          box-sizing: border-box !important;
         }
 
         [contenteditable="true"]:focus {
+          font-size: 16px !important;
           scroll-margin-bottom: 20px;
         }
 
