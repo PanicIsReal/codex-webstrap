@@ -1,6 +1,6 @@
 {
   "name": "codex-webstrapper",
-  "version": "0.2.0",
+  "version": "0.9.0",
   "type": "module",
   "description": "Web wrapper for Codex desktop assets with bridge + token auth",
   "license": "MIT",
@@ -12,7 +12,12 @@
   "bugs": {
     "url": "https://github.com/PanicIsReal/codex-webstrap/issues"
   },
-  "keywords": ["codex", "electron", "web-bridge", "websocket"],
+  "keywords": [
+    "codex",
+    "electron",
+    "web-bridge",
+    "websocket"
+  ],
   "bin": {
     "codex-webstrap": "./bin/codex-webstrap.sh",
     "codex-webstrapper": "./bin/codex-webstrap.sh"
