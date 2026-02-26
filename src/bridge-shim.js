@@ -333,11 +333,11 @@
       /* ==== Tablet & small screen fixes (max-width: 768px) ==== */
       @media (max-width: 768px) {
 
-        /* Viewport stabilization — only on body, NOT html.
-           Setting overflow-x:hidden on <html> breaks iOS momentum scrolling
-           for nested scroll containers. */
+        /* Viewport stabilization — body must be overflow:hidden on BOTH axes
+           so iOS doesn't treat it as a competing scroll target.
+           Do NOT set overflow on <html> — that kills momentum scrolling. */
         body {
-          overflow-x: hidden !important;
+          overflow: hidden !important;
           -webkit-text-size-adjust: 100% !important;
         }
 
@@ -354,13 +354,16 @@
           white-space: nowrap !important;
         }
 
-        /* Ensure scroll containers work on iOS.
-           -webkit-overflow-scrolling:touch enables momentum scrolling.
-           touch-action:pan-y ensures vertical swipes are treated as scrolls. */
+        /* Ensure thread/sidebar scroll containers work reliably on iOS.
+           - overflow-x:hidden removes horizontal ambiguity so iOS always scrolls vertically
+           - -webkit-overflow-scrolling:touch enables momentum/inertial scrolling
+           - touch-action:pan-y tells the browser vertical swipes = scroll */
         .vertical-scroll-fade-mask-top,
         .vertical-scroll-fade-mask,
         [class*="overflow-y-auto"],
         [class*="overflow-auto"] {
+          overflow-x: hidden !important;
+          overflow-y: auto !important;
           -webkit-overflow-scrolling: touch !important;
           touch-action: pan-y !important;
         }
