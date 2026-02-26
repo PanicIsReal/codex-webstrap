@@ -151,11 +151,18 @@ export async function ensureExtractedAssets({
 }
 
 export async function buildPatchedIndexHtml(indexPath) {
-  const html = await fsp.readFile(indexPath, "utf8");
+  let html = await fsp.readFile(indexPath, "utf8");
   const shimTag = '<script src="/__webstrapper/shim.js"></script>';
 
   if (html.includes(shimTag)) {
     return html;
+  }
+
+  // Inject mobile viewport meta if not already present
+  const viewportMeta =
+    '<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">';
+  if (!html.includes('name="viewport"') && html.includes("</head>")) {
+    html = html.replace("</head>", `  ${viewportMeta}\n</head>`);
   }
 
   if (html.includes("</head>")) {

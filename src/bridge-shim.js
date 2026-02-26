@@ -7,6 +7,7 @@
   const mainMessageHistory = [];
   const CONTEXT_MENU_ROOT_ID = "__codex-webstrap-context-menu-root";
   const CONTEXT_MENU_STYLE_ID = "__codex-webstrap-context-menu-style";
+  const MOBILE_STYLE_ID = "__codex-webstrap-mobile-style";
 
   let ws = null;
   let connected = false;
@@ -317,6 +318,193 @@
     document.head.appendChild(style);
   }
 
+  // ---------------------------------------------------------------------------
+  // Mobile-responsive CSS overrides
+  // ---------------------------------------------------------------------------
+
+  function ensureMobileStyles() {
+    if (document.getElementById(MOBILE_STYLE_ID)) {
+      return;
+    }
+
+    const style = document.createElement("style");
+    style.id = MOBILE_STYLE_ID;
+    style.textContent = `
+      /* ==== Tablet & small screen fixes (max-width: 768px) ==== */
+      @media (max-width: 768px) {
+
+        /* Viewport stabilization */
+        html, body {
+          overflow-x: hidden !important;
+          -webkit-text-size-adjust: 100% !important;
+        }
+
+        /* Header overflow fix */
+        .h-toolbar {
+          max-width: 100vw !important;
+          overflow: hidden !important;
+        }
+
+        .h-toolbar button {
+          flex-shrink: 1 !important;
+          min-width: 0 !important;
+          overflow: hidden !important;
+          text-overflow: ellipsis !important;
+          white-space: nowrap !important;
+        }
+
+        /* Chat input — keyboard-friendly */
+        [contenteditable="true"] {
+          max-width: 100% !important;
+          box-sizing: border-box !important;
+        }
+
+        [contenteditable="true"]:focus {
+          scroll-margin-bottom: 20px;
+        }
+
+        /* Terminal — constrain height */
+        [class*="terminal"],
+        [class*="Terminal"] {
+          max-height: 40vh !important;
+        }
+
+        /* Dialogs/modals — fit screen */
+        [role="dialog"] {
+          max-width: calc(100vw - 16px) !important;
+          max-height: calc(100dvh - 32px) !important;
+          overflow-y: auto !important;
+          margin: 8px !important;
+        }
+
+        /* Context menu — responsive sizing */
+        #${CONTEXT_MENU_ROOT_ID} .cw-menu {
+          min-width: min(220px, calc(100vw - 24px)) !important;
+          max-width: calc(100vw - 24px) !important;
+        }
+
+        #${CONTEXT_MENU_ROOT_ID} .cw-item--submenu > .cw-menu {
+          position: fixed !important;
+          left: 12px !important;
+          right: 12px !important;
+          top: auto !important;
+          width: auto !important;
+        }
+
+        /* Overflow prevention */
+        pre, code {
+          overflow-x: auto !important;
+          max-width: 100% !important;
+          word-break: break-word !important;
+        }
+      }
+
+      /* ==== Phone layout (max-width: 600px) ==== */
+      @media (max-width: 600px) {
+
+        /* Safe area support for notched devices */
+        body {
+          padding-top: env(safe-area-inset-top) !important;
+          padding-bottom: env(safe-area-inset-bottom) !important;
+          padding-left: env(safe-area-inset-left) !important;
+          padding-right: env(safe-area-inset-right) !important;
+        }
+
+        /* CRITICAL: Collapse sidebar token so main content gets full width.
+           The Codex app uses --spacing-token-sidebar with a 240px clamp minimum
+           which is far too wide on phones. Setting it to 0 makes the sidebar an
+           overlay instead of pushing the main content off-screen. */
+        :root {
+          --spacing-token-sidebar: 0px !important;
+        }
+
+        /* Sidebar becomes full-screen overlay when open */
+        .window-fx-sidebar-surface,
+        .w-token-sidebar {
+          width: 85vw !important;
+          max-width: 320px !important;
+          z-index: 50 !important;
+          box-shadow: 4px 0 24px rgba(0, 0, 0, 0.5) !important;
+        }
+
+        /* Main content takes full width */
+        .main-surface,
+        .left-token-sidebar {
+          left: 0 !important;
+          width: 100vw !important;
+        }
+
+        /* Header left section — collapse to fit phone */
+        .app-header-left {
+          width: auto !important;
+          max-width: 50vw !important;
+          flex-shrink: 1 !important;
+          padding-left: 8px !important;
+        }
+
+        /* Use stable viewport height */
+        #root {
+          height: calc(var(--cw-vh, 1vh) * 100) !important;
+          height: 100dvh !important;
+        }
+      }
+    `;
+    document.head.appendChild(style);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Viewport height stabilizer (mobile keyboard / chrome bar)
+  // ---------------------------------------------------------------------------
+
+  function installViewportStabilizer() {
+    if (!window.visualViewport) {
+      return;
+    }
+
+    const update = () => {
+      document.documentElement.style.setProperty(
+        "--cw-vh",
+        window.visualViewport.height * 0.01 + "px"
+      );
+    };
+
+    window.visualViewport.addEventListener("resize", update);
+    update();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Auto-collapse sidebar on mobile first load
+  // ---------------------------------------------------------------------------
+
+  function autoCollapseSidebarOnMobile() {
+    if (window.innerWidth > 600) {
+      return;
+    }
+
+    // The React app restores sidebar state from storage after mount.
+    // We poll briefly after DOM ready to catch the sidebar in its open state.
+    function tryCollapse(attempts) {
+      if (attempts <= 0) {
+        return;
+      }
+      const btn = document.querySelector('button[aria-label="Hide sidebar"]');
+      if (btn) {
+        btn.click();
+        return;
+      }
+      setTimeout(() => tryCollapse(attempts - 1), 200);
+    }
+
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", () => {
+        // Give React time to mount and restore sidebar state
+        setTimeout(() => tryCollapse(15), 500);
+      });
+    } else {
+      setTimeout(() => tryCollapse(15), 500);
+    }
+  }
+
   function normalizeContextMenuItems(items) {
     if (!Array.isArray(items)) {
       return [];
@@ -344,6 +532,7 @@
 
     window.removeEventListener("keydown", current.onKeyDown, true);
     window.removeEventListener("resize", current.onWindowChange, true);
+    clearTimeout(current.resizeDebounce);
 
     current.root.remove();
     current.resolve(result ?? null);
@@ -449,8 +638,10 @@
         }
       };
 
+      let resizeDebounce = null;
       const onWindowChange = () => {
-        closeContextMenu(null);
+        clearTimeout(resizeDebounce);
+        resizeDebounce = setTimeout(() => closeContextMenu(null), 300);
       };
 
       root.addEventListener("mousedown", onRootMouseDown);
@@ -462,7 +653,8 @@
         root,
         resolve,
         onKeyDown,
-        onWindowChange
+        onWindowChange,
+        get resizeDebounce() { return resizeDebounce; }
       };
 
       window.addEventListener("keydown", onKeyDown, true);
@@ -675,6 +867,9 @@
   window.codexWindowType = "electron";
   window.electronBridge = electronBridge;
   installBrowserCompatibilityShims();
+  ensureMobileStyles();
+  installViewportStabilizer();
+  autoCollapseSidebarOnMobile();
   window.addEventListener("contextmenu", rememberContextMenuPosition, true);
 
   connect();
