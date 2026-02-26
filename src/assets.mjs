@@ -158,10 +158,14 @@ export async function buildPatchedIndexHtml(indexPath) {
     return html;
   }
 
-  // Inject mobile viewport meta if not already present
+  // Replace or inject mobile viewport meta — the Electron app's default
+  // viewport lacks maximum-scale and user-scalable=no, causing iOS zoom issues
   const viewportMeta =
-    '<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">';
-  if (!html.includes('name="viewport"') && html.includes("</head>")) {
+    '<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">';
+  const existingViewport = html.match(/<meta\s+name=["']viewport["'][^>]*>/i);
+  if (existingViewport) {
+    html = html.replace(existingViewport[0], viewportMeta);
+  } else if (html.includes("</head>")) {
     html = html.replace("</head>", `  ${viewportMeta}\n</head>`);
   }
 

@@ -126,10 +126,29 @@ export function createAuthController({ token, sessionStore, cookieName = SESSION
     );
   }
 
-  function requireAuth(req, res) {
+  function requireAuth(req, res, parsedUrl) {
     if (hasValidSession(req)) {
       return true;
     }
+
+    // Auto-authenticate if a valid token is in the URL query string.
+    // This lets iOS "Add to Home Screen" bookmarks work — the saved URL
+    // includes ?token=X, so each launch re-authenticates automatically.
+    if (parsedUrl) {
+      const provided = parsedUrl.searchParams.get("token") || "";
+      if (provided && provided === token) {
+        const session = sessionStore.createSession();
+        const cookie = serializeCookie(cookieName, session.id, {
+          maxAgeSeconds: Math.floor(sessionStore.ttlMs / 1000),
+          httpOnly: true,
+          sameSite: "Lax",
+          path: "/"
+        });
+        res.setHeader("set-cookie", cookie);
+        return true;
+      }
+    }
+
     rejectUnauthorized(res);
     return false;
   }
@@ -153,7 +172,7 @@ export function createAuthController({ token, sessionStore, cookieName = SESSION
 
     res.statusCode = 302;
     res.setHeader("set-cookie", cookie);
-    res.setHeader("location", "/");
+    res.setHeader("location", `/?token=${encodeURIComponent(provided)}`);
     res.end();
   }
 

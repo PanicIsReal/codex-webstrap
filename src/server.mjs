@@ -216,7 +216,7 @@ async function main() {
         return;
       }
 
-      if (!auth.requireAuth(req, res)) {
+      if (!auth.requireAuth(req, res, url)) {
         return;
       }
 
