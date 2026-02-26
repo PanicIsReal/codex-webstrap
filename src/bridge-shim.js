@@ -425,6 +425,7 @@
           max-width: 320px !important;
           z-index: 50 !important;
           box-shadow: 4px 0 24px rgba(0, 0, 0, 0.5) !important;
+          background-color: rgb(24, 24, 24) !important;
         }
 
         /* Main content takes full width */
