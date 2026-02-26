@@ -333,8 +333,10 @@
       /* ==== Tablet & small screen fixes (max-width: 768px) ==== */
       @media (max-width: 768px) {
 
-        /* Viewport stabilization */
-        html, body {
+        /* Viewport stabilization — only on body, NOT html.
+           Setting overflow-x:hidden on <html> breaks iOS momentum scrolling
+           for nested scroll containers. */
+        body {
           overflow-x: hidden !important;
           -webkit-text-size-adjust: 100% !important;
         }
@@ -350,6 +352,17 @@
           overflow: hidden !important;
           text-overflow: ellipsis !important;
           white-space: nowrap !important;
+        }
+
+        /* Ensure scroll containers work on iOS.
+           -webkit-overflow-scrolling:touch enables momentum scrolling.
+           touch-action:pan-y ensures vertical swipes are treated as scrolls. */
+        .vertical-scroll-fade-mask-top,
+        .vertical-scroll-fade-mask,
+        [class*="overflow-y-auto"],
+        [class*="overflow-auto"] {
+          -webkit-overflow-scrolling: touch !important;
+          touch-action: pan-y !important;
         }
 
         /* Prevent iOS auto-zoom on focus (triggers when font-size < 16px) */
