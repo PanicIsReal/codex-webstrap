@@ -353,10 +353,16 @@
           white-space: nowrap !important;
         }
 
-        /* Chat input — keyboard-friendly */
-        [contenteditable="true"] {
+        /* Prevent iOS auto-zoom on focus (triggers when font-size < 16px) */
+        input, textarea, select, [contenteditable="true"] {
+          font-size: 16px !important;
           max-width: 100% !important;
           box-sizing: border-box !important;
+        }
+
+        /* Disable double-tap zoom */
+        * {
+          touch-action: manipulation;
         }
 
         [contenteditable="true"]:focus {
