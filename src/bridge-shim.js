@@ -425,7 +425,10 @@
           --spacing-token-sidebar: 0px !important;
         }
 
-        /* Sidebar becomes full-screen overlay when open */
+        /* Sidebar becomes full-screen overlay when open.
+           When collapsed the app sets opacity-0 but the element still covers
+           the screen (translate is 0 because we zeroed the token). We must
+           disable pointer events so it doesn't block taps on main content. */
         .window-fx-sidebar-surface,
         .w-token-sidebar {
           width: 85vw !important;
@@ -433,6 +436,15 @@
           z-index: 50 !important;
           box-shadow: 4px 0 24px rgba(0, 0, 0, 0.5) !important;
           background-color: rgb(24, 24, 24) !important;
+          pointer-events: none !important;
+          transition: opacity 0.3s ease, pointer-events 0s linear 0.3s !important;
+        }
+
+        /* Re-enable pointer events only when sidebar is visible (open) */
+        .window-fx-sidebar-surface.opacity-100,
+        .w-token-sidebar.opacity-100 {
+          pointer-events: auto !important;
+          transition: opacity 0.3s ease, pointer-events 0s linear 0s !important;
         }
 
         /* Main content takes full width */
